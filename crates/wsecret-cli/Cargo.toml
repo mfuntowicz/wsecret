@@ -1,0 +1,48 @@
+[package]
+name = "wsecret-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "wsecret"
+path = "src/main.rs"
+
+[[test]]
+name = "p4"
+path = "tests/p4.rs"
+harness = false
+
+[dependencies]
+wsecret-core = { path = "../wsecret-core" }
+# Narrow pinned-libhydrogen boundary for the CLI's `new`/`renew` random
+# generation (`hydro_random_buf`) and the passphrase-retype comparison
+# (`hydro_equal`), both verbatim upstream C (plan: no cryptography in Rust).
+# wsecret-core deliberately exposes no RNG/equality API.
+libhydrogen-sys = { path = "../libhydrogen-sys" }
+# Raw stdout writes (`write_stdout`) need the console handle + WriteFile;
+# no CRT text mode, no CRLF/code-page conversion, no BOM (plan §4).
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
+# The integration-test harness (tests/harness/) drives the real binary through
+# a console and independent OS oracles; these are the extra Win32 surfaces it
+# needs (features unify with the dependency above for test builds only).
+[dev-dependencies]
+# P4/fault-injection acceptance probes exercise the same test-only seams as
+# the core crate. Production builds never enable this feature.
+wsecret-core = { path = "../wsecret-core", features = ["fault-injection"] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
