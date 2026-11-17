@@ -1,0 +1,9 @@
+[package]
+name = "libhydrogen-sys"
+version = "0.1.0"
+edition = "2024"
+links = "hydrogen"
+publish = false
+
+[build-dependencies]
+cc = { workspace = true }
