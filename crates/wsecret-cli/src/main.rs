@@ -1141,7 +1141,6 @@ mod tests {
     /// (fast opslimit) plus whole records appended upstream-style.
     struct Fixture {
         path: PathBuf,
-        header: Header,
     }
 
     impl Fixture {
@@ -1154,7 +1153,7 @@ mod tests {
                     .append_or_reuse(None, &session, name, value)
                     .expect("append record");
             }
-            Fixture { path, header }
+            Fixture { path }
         }
 
         fn empty(tag: &str) -> Fixture {

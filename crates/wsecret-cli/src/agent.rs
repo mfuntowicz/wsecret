@@ -133,14 +133,6 @@ impl AgentLaunchError {
             AgentLaunchError::Core(e) => Some(e.to_string()),
         }
     }
-
-    /// Upstream exit code: `Cancelled` exits 0, everything else 1.
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            AgentLaunchError::Cancelled => 0,
-            _ => 1,
-        }
-    }
 }
 
 /// Acquisition for every store-using command (plan §5.2 steps 2–6). Returns
@@ -254,7 +246,7 @@ where
         return Err(AgentLaunchError::Cancelled);
     }
     // `Session::unlock` zeroizes `pass` on every return path.
-    let mut session = Session::unlock(header, &mut pass).map_err(AgentLaunchError::Core)?;
+    let session = Session::unlock(header, &mut pass).map_err(AgentLaunchError::Core)?;
 
     // Upstream `pass_ok`: does ANY record decrypt with this key?
     let mut decryptable = false;
@@ -417,7 +409,7 @@ mod tests {
 
         let (mut store, header, _receipt) =
             Store::create(&path, OPS_LIMIT_MIN).expect("store create");
-        let mut victim =
+        let victim =
             Session::unlock(&header, &mut b"victim-passphrase".to_vec()).expect("victim unlock");
         store
             .append_or_reuse(None, &victim, b"old", b"victim secret")
@@ -497,7 +489,7 @@ mod tests {
     #[test]
     fn unlock_prompts_once_when_records_exist() {
         let (path, mut store, header) = temp_store("once");
-        let mut session = Session::unlock(&header, &mut b"pass-a".to_vec()).expect("unlock");
+        let session = Session::unlock(&header, &mut b"pass-a".to_vec()).expect("unlock");
         store
             .append_or_reuse(None, &session, b"k", b"v")
             .expect("record");
@@ -546,7 +538,6 @@ mod tests {
         };
         assert!(matches!(err, AgentLaunchError::PassphraseMismatch));
         assert_eq!(err.message().as_deref(), Some("Passphrases don't match!"));
-        assert_eq!(err.exit_code(), 1);
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
@@ -560,7 +551,6 @@ mod tests {
         };
         assert!(matches!(err, AgentLaunchError::Cancelled));
         assert_eq!(err.message(), None);
-        assert_eq!(err.exit_code(), 0);
         drop(store);
         let _ = std::fs::remove_file(&path);
     }

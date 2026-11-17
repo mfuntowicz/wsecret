@@ -103,13 +103,6 @@ pub fn is_console() -> bool {
     con::stdout_is_console()
 }
 
-/// Writes `text` to `CONOUT$` — prompts and echo-suppressed output go to the
-/// console, never to (possibly redirected) stdout.
-pub fn write_console(text: &str) -> Result<(), ConsoleError> {
-    let output = con::open_console_output().map_err(ConsoleError::ConsoleOut)?;
-    output.write_text(text).map_err(ConsoleError::ConsoleOut)
-}
-
 /// Installs the console-ctrl parity handler once (plan §4: "console-ctrl
 /// handler ignoring CTRL_C/CTRL_CLOSE equivalents of the upstream ignored
 /// signals where legal"). Upstream's `s_handler` is empty (HUP/INT/QUIT/
