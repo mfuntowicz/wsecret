@@ -14,15 +14,15 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, GetFileInformationByHandle, GetFileSizeEx,
-    GetFinalPathNameByHandleW, LockFileEx, ReadFile, SetFilePointerEx, UnlockFileEx, WriteFile,
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_BEGIN, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers, GetFileInformationByHandle, GetFileSizeEx,
+    GetFinalPathNameByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    ReadFile, SetFilePointerEx, UnlockFileEx, WriteFile,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -174,7 +174,12 @@ pub fn final_path(file: &File) -> io::Result<Vec<u8>> {
 fn set_pos(file: &File, offset: u64) -> io::Result<()> {
     // SAFETY: valid handle; a null new-position pointer is allowed.
     let ok = unsafe {
-        SetFilePointerEx(file.as_raw_handle() as HANDLE, offset as i64, ptr::null_mut(), FILE_BEGIN)
+        SetFilePointerEx(
+            file.as_raw_handle() as HANDLE,
+            offset as i64,
+            ptr::null_mut(),
+            FILE_BEGIN,
+        )
     };
     if ok == 0 {
         return Err(last_error());
@@ -333,7 +338,7 @@ pub fn file_len(file: &File) -> io::Result<u64> {
 /// [`super::security`] for object DACLs).
 pub fn current_user_sid() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Security::{
-        GetLengthSid, GetTokenInformation, TokenUser, PSID, TOKEN_QUERY, TOKEN_USER,
+        GetLengthSid, GetTokenInformation, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -375,7 +380,10 @@ pub fn current_user_sid() -> io::Result<Vec<u8>> {
     // success with the exact `needed` size).
     let sid = unsafe { *(buf.as_ptr() as *const TOKEN_USER) }.User.Sid as PSID;
     if sid.is_null() {
-        return Err(io::Error::new(io::ErrorKind::Other, "token has no user SID"));
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "token has no user SID",
+        ));
     }
     // SAFETY: `sid` points into `buf` and is a valid SID.
     let len = unsafe { GetLengthSid(sid) } as usize;

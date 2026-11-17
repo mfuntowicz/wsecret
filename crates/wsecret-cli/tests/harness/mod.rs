@@ -37,34 +37,33 @@ use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
 use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Cryptography::{
+    BCRYPT_ALG_HANDLE, BCRYPT_ALG_HANDLE_HMAC_FLAG, BCRYPT_HASH_HANDLE, BCRYPT_OBJECT_LENGTH,
     BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash,
-    BCryptGetProperty, BCryptHashData, BCryptOpenAlgorithmProvider, BCRYPT_ALG_HANDLE,
-    BCRYPT_ALG_HANDLE_HMAC_FLAG, BCRYPT_HASH_HANDLE, BCRYPT_OBJECT_LENGTH,
+    BCryptGetProperty, BCryptHashData, BCryptOpenAlgorithmProvider,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
-    AllocConsole, FillConsoleOutputCharacterW, FlushConsoleInputBuffer, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetStdHandle, ReadConsoleOutputCharacterW, WriteConsoleInputW,
-    CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT, INPUT_RECORD, INPUT_RECORD_0,
-    KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+    AllocConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT,
+    FillConsoleOutputCharacterW, FlushConsoleInputBuffer, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT_RECORD,
+    KEY_EVENT_RECORD_0, ReadConsoleOutputCharacterW, WriteConsoleInputW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use wsecret_core::session::Session;
@@ -156,7 +155,10 @@ fn workspace_root() -> PathBuf {
 /// A fresh per-test store copy under the system temp dir (plan C11 fixture
 /// reset rule: each mutating scenario starts from a fresh store).
 pub fn temp_store(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("wsecret-xcheck-{tag}-{}.secret", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "wsecret-xcheck-{tag}-{}.secret",
+        std::process::id()
+    ))
 }
 
 /// The `wsecret` binary under test (built before integration tests run).
@@ -186,12 +188,20 @@ pub fn build_fixture(path: &Path) {
         (b"test/totp32", VALUE_TOTP32),
         (b"DELETED:test", VALUE_TOMBSTONE),
     ] {
-        store.append_or_reuse(None, &a, name, value).expect("append P_A record");
+        store
+            .append_or_reuse(None, &a, name, value)
+            .expect("append P_A record");
     }
     let mut b = Session::unlock(store.header(), &mut PASS_B.to_vec()).expect("unlock P_B");
-    store.append_or_reuse(None, &b, b"b1", VALUE_B1).expect("append P_B record");
-    store.append_or_reuse(None, &b, b"b2", VALUE_B2).expect("append P_B record");
-    store.append_or_reuse(None, &b, b"b3", VALUE_B3).expect("append P_B record");
+    store
+        .append_or_reuse(None, &b, b"b1", VALUE_B1)
+        .expect("append P_B record");
+    store
+        .append_or_reuse(None, &b, b"b2", VALUE_B2)
+        .expect("append P_B record");
+    store
+        .append_or_reuse(None, &b, b"b3", VALUE_B3)
+        .expect("append P_B record");
     a.lock();
     b.lock();
     drop(store);
@@ -200,7 +210,12 @@ pub fn build_fixture(path: &Path) {
 /// Every 512-byte block of the store, in file order.
 pub fn blocks(path: &Path) -> Vec<[u8; 512]> {
     let raw = fs::read(path).expect("read store");
-    assert_eq!(raw.len() % 512, 0, "store length must be block-aligned: {}", raw.len());
+    assert_eq!(
+        raw.len() % 512,
+        0,
+        "store length must be block-aligned: {}",
+        raw.len()
+    );
     raw.chunks_exact(512)
         .map(|c| {
             let mut b = [0u8; 512];
@@ -217,7 +232,10 @@ pub fn slot_of(path: &Path, pass: &[u8], name: &[u8]) -> u64 {
     let mut session = Session::unlock(&header, &mut pass.to_vec()).expect("unlock");
     let slot = match store.find(&session, name, false).expect("find") {
         ScanOutcome::Found { slot, .. } => slot,
-        other => panic!("record {:?} not found: {other:?}", String::from_utf8_lossy(name)),
+        other => panic!(
+            "record {:?} not found: {other:?}",
+            String::from_utf8_lossy(name)
+        ),
     };
     session.lock();
     slot
@@ -261,7 +279,10 @@ fn bcryp_hash(alg: &str, hmac_key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
             panic!("BCrypt {what} failed: {status:#x}");
         }
     }
-    let alg_wide: Vec<u16> = OsStr::new(alg).encode_wide().chain(std::iter::once(0)).collect();
+    let alg_wide: Vec<u16> = OsStr::new(alg)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: all handles are created and destroyed within this function;
     // buffers out-live every call below.
     unsafe {
@@ -272,7 +293,12 @@ fn bcryp_hash(alg: &str, hmac_key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
             0
         };
         check(
-            BCryptOpenAlgorithmProvider(&mut alg_handle, alg_wide.as_ptr(), std::ptr::null(), flags),
+            BCryptOpenAlgorithmProvider(
+                &mut alg_handle,
+                alg_wide.as_ptr(),
+                std::ptr::null(),
+                flags,
+            ),
             "OpenAlgorithmProvider",
         );
         let obj_len = property_u32(alg_handle as _, BCRYPT_OBJECT_LENGTH);
@@ -283,13 +309,27 @@ fn bcryp_hash(alg: &str, hmac_key: Option<&[u8]>, data: &[u8], out: &mut [u8]) {
             None => (std::ptr::null(), 0),
         };
         check(
-            BCryptCreateHash(alg_handle, &mut hash, obj.as_mut_ptr(), obj_len, key_ptr, key_len, 0),
+            BCryptCreateHash(
+                alg_handle,
+                &mut hash,
+                obj.as_mut_ptr(),
+                obj_len,
+                key_ptr,
+                key_len,
+                0,
+            ),
             "CreateHash",
         );
         if !data.is_empty() {
-            check(BCryptHashData(hash, data.as_ptr(), data.len() as u32, 0), "HashData");
+            check(
+                BCryptHashData(hash, data.as_ptr(), data.len() as u32, 0),
+                "HashData",
+            );
         }
-        check(BCryptFinishHash(hash, out.as_mut_ptr(), out.len() as u32, 0), "FinishHash");
+        check(
+            BCryptFinishHash(hash, out.as_mut_ptr(), out.len() as u32, 0),
+            "FinishHash",
+        );
         BCryptDestroyHash(hash);
         BCryptCloseAlgorithmProvider(alg_handle, 0);
     }
@@ -303,7 +343,14 @@ fn property_u32(
     let mut got = 0u32;
     // SAFETY: `handle` is live; `value` out-lives the call.
     let status = unsafe {
-        BCryptGetProperty(handle, name, &mut value as *mut u32 as *mut u8, 4, &mut got, 0)
+        BCryptGetProperty(
+            handle,
+            name,
+            &mut value as *mut u32 as *mut u8,
+            4,
+            &mut got,
+            0,
+        )
     };
     if status != 0 {
         panic!("BCryptGetProperty failed: {status:#x}");
@@ -348,7 +395,12 @@ pub fn upstream_show(name: &str) -> Option<Vec<u8>> {
     let hex = upstream_oracle(&["show", name])?;
     let hex = hex.trim();
     assert!(hex.len() % 2 == 0, "oracle returned odd hex: {hex:?}");
-    Some((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex")).collect())
+    Some(
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect(),
+    )
 }
 
 /// Repository-local oracle script expressed as a WSL mount path. Running the
@@ -436,7 +488,10 @@ impl ConsoleSession {
         }
         let conout = open_conout();
         if conout == INVALID_HANDLE_VALUE {
-            panic!("no console output available for prompt tests: {}", last_error());
+            panic!(
+                "no console output available for prompt tests: {}",
+                last_error()
+            );
         }
         ConsoleSession {
             _guard: guard,
@@ -514,7 +569,10 @@ fn open_conout() -> HANDLE {
 }
 
 pub fn open_console_device(name: &str) -> HANDLE {
-    let w: Vec<u16> = OsStr::new(name).encode_wide().chain(std::iter::once(0)).collect();
+    let w: Vec<u16> = OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: `w` is a NUL-terminated device name; the result is checked.
     let h = unsafe {
         CreateFileW(
@@ -573,7 +631,10 @@ fn read_screen_since(handle: HANDLE) -> (Vec<String>, i16) {
         return (Vec::new(), 0);
     };
     let last = lines.iter().rposition(|l| !l.is_empty()).unwrap_or(first);
-    (lines[first..=last].to_vec(), info.dwCursorPosition.Y - first as i16)
+    (
+        lines[first..=last].to_vec(),
+        info.dwCursorPosition.Y - first as i16,
+    )
 }
 
 fn type_line(conin: HANDLE, text: &str) {
@@ -732,7 +793,10 @@ pub fn run_wsecret_lines(
 ) -> Run {
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     env.retain(|(k, _)| k != "SECRET_STORE" && k != "SECRET_AGENT");
-    env.push((OsString::from("SECRET_STORE"), store.as_os_str().to_os_string()));
+    env.push((
+        OsString::from("SECRET_STORE"),
+        store.as_os_str().to_os_string(),
+    ));
     let env_block = env_block(&env);
 
     let (process, handles) = match stdout {
@@ -745,7 +809,7 @@ pub fn run_wsecret_lines(
             let conin = open_console_device("CONIN$");
             let conout = session.hidden();
             unsafe {
-                use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+                use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
                 SetHandleInformation(conin, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
             }
             let restore = swap_std_handles(conin, conout);
@@ -757,8 +821,8 @@ pub fn run_wsecret_lines(
             (process, Vec::new())
         }
         ChildStdout::CaptureFile(path) => {
-            let err_path = std::env::temp_dir()
-                .join(format!("wsecret-xcheck-err-{}.bin", std::process::id()));
+            let err_path =
+                std::env::temp_dir().join(format!("wsecret-xcheck-err-{}.bin", std::process::id()));
             let _ = fs::remove_file(path);
             let _ = fs::remove_file(&err_path);
             let stdout_handle = open_file(path, true);
@@ -800,8 +864,8 @@ pub fn run_wsecret_lines(
 
     let (stdout, stderr) = match stdout {
         ChildStdout::CaptureFile(path) => {
-            let err_path = std::env::temp_dir()
-                .join(format!("wsecret-xcheck-err-{}.bin", std::process::id()));
+            let err_path =
+                std::env::temp_dir().join(format!("wsecret-xcheck-err-{}.bin", std::process::id()));
             let out = fs::read(path).expect("read captured stdout");
             let err = fs::read(&err_path).unwrap_or_default();
             let _ = fs::remove_file(&err_path);
@@ -822,7 +886,7 @@ pub fn run_wsecret_lines(
 /// `CONIN$`/`CONOUT$` through `GetStdHandle`, no inherit list needed).
 fn swap_std_handles(conin: HANDLE, conout: HANDLE) -> impl FnOnce() {
     use windows_sys::Win32::System::Console::{
-        SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
     };
     // SAFETY: `GetStdHandle`/`SetStdHandle` operate on this process's slots.
     let (old_in, old_out, old_err) = unsafe {
@@ -858,7 +922,11 @@ fn create_console_process(exe: &Path, args: &[&str], env_block: &[u16]) -> HANDL
         cmdline.extend(quote(OsStr::new(a)));
     }
     cmdline.push(0);
-    let app: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let app: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut si = STARTUPINFOEXW::default();
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     let mut pi = PROCESS_INFORMATION::default();
@@ -918,8 +986,15 @@ fn write_all(handle: HANDLE, mut data: &[u8]) {
     while !data.is_empty() {
         let mut written = 0u32;
         // SAFETY: live handle, valid buffer.
-        let ok =
-            unsafe { WriteFile(handle, data.as_ptr(), data.len() as u32, &mut written, std::ptr::null_mut()) };
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                data.as_ptr(),
+                data.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
         if ok == 0 || written == 0 {
             panic!("WriteFile failed: {}", last_error());
         }
@@ -928,8 +1003,12 @@ fn write_all(handle: HANDLE, mut data: &[u8]) {
 }
 
 pub fn open_file(path: &Path, write: bool) -> HANDLE {
-    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
-    let w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    let w: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let access = if write { GENERIC_WRITE } else { GENERIC_READ };
     // SAFETY: NUL-terminated path; the handle is checked below.
     let h = unsafe {
@@ -957,7 +1036,7 @@ pub fn open_file(path: &Path, write: bool) -> HANDLE {
 }
 
 pub fn dup_inheritable(src: HANDLE) -> HANDLE {
-    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut dup: HANDLE = std::ptr::null_mut();
     // SAFETY: both processes are the current process; `src` is live.
@@ -1006,7 +1085,11 @@ pub fn create_process(
         cmdline.extend(quote(OsStr::new(a)));
     }
     cmdline.push(0);
-    let app: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let app: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     let mut attr_size = 0usize;
     // SAFETY: sizing call (documented two-step pattern).
@@ -1117,7 +1200,10 @@ pub fn env_block(vars: &[(OsString, OsString)]) -> Vec<u16> {
         })
         .collect();
     entries.sort_by_key(|e| {
-        let eq = e.iter().position(|&c| c == u16::from(b'=')).unwrap_or(e.len());
+        let eq = e
+            .iter()
+            .position(|&c| c == u16::from(b'='))
+            .unwrap_or(e.len());
         e[..eq]
             .iter()
             .map(|&c| if (65..=90).contains(&c) { c + 32 } else { c })

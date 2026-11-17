@@ -19,8 +19,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, ReadConsoleW, SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleW,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetStdHandle, ReadConsoleW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleW,
 };
 
 /// `CreateFileW` disposition `OPEN_EXISTING` (winbase.h constant; same
@@ -175,7 +175,10 @@ impl ConsoleOutput {
             return Err(io::Error::last_os_error());
         }
         if written as usize != units.len() {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "short console write"));
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short console write",
+            ));
         }
         Ok(())
     }

@@ -100,7 +100,12 @@ pub fn pwhash_deterministic(
 /// Encrypts `msg` (476 bytes) into `out` (512 bytes = 36-byte header + 476)
 /// with message id 0.
 #[inline]
-pub fn secretbox_encrypt(out: &mut [u8; ENTRY_BYTES], msg: &[u8; ENTRY_PAYLOAD], ctx: &[u8; 8], key: &[u8; 32]) {
+pub fn secretbox_encrypt(
+    out: &mut [u8; ENTRY_BYTES],
+    msg: &[u8; ENTRY_PAYLOAD],
+    ctx: &[u8; 8],
+    key: &[u8; 32],
+) {
     init();
     // SAFETY: `out` is `HEADERBYTES + msg.len()` bytes; `msg` and `key` are
     // read-only and cannot alias `out` (`&mut` vs `&`); `ctx` is exactly
@@ -122,7 +127,12 @@ pub fn secretbox_encrypt(out: &mut [u8; ENTRY_BYTES], msg: &[u8; ENTRY_PAYLOAD],
 /// Decrypts `ct` (512 bytes) into `out` (476 bytes). Returns `false` on MAC
 /// failure; the C implementation zeroes the plaintext buffer on failure.
 #[inline]
-pub fn secretbox_decrypt(out: &mut [u8; ENTRY_PAYLOAD], ct: &[u8; ENTRY_BYTES], ctx: &[u8; 8], key: &[u8; 32]) -> bool {
+pub fn secretbox_decrypt(
+    out: &mut [u8; ENTRY_PAYLOAD],
+    ct: &[u8; ENTRY_BYTES],
+    ctx: &[u8; 8],
+    key: &[u8; 32],
+) -> bool {
     // No `init()` needed here: decrypting with a fixed key is pure and the
     // RNG is untouched.
     // SAFETY: `out` is exactly `clen - HEADERBYTES` bytes; `ct` and `key` are
@@ -183,7 +193,13 @@ pub fn equal(a: &[u8], b: &[u8]) -> bool {
     // SAFETY: the identical-buffer case returned above, so `a` and `b` point
     // to distinct memory; both pointers are valid for the shared length and
     // `hydro_equal` only reads.
-    unsafe { hydro_equal(a.as_ptr().cast::<c_void>(), b.as_ptr().cast::<c_void>(), a.len()) }
+    unsafe {
+        hydro_equal(
+            a.as_ptr().cast::<c_void>(),
+            b.as_ptr().cast::<c_void>(),
+            a.len(),
+        )
+    }
 }
 
 /// Hashes `input` into `out` (16..=65535 bytes, `hydro_hash_BYTES_MIN/MAX`)
@@ -242,7 +258,11 @@ mod tests {
         }
         let mut ct = [0u8; ENTRY_BYTES];
         secretbox_encrypt(&mut ct, &msg, &CTX_SECRET, &key);
-        assert_ne!(&ct[SECRETBOX_HEADERBYTES..], &msg[..], "plaintext must be encrypted");
+        assert_ne!(
+            &ct[SECRETBOX_HEADERBYTES..],
+            &msg[..],
+            "plaintext must be encrypted"
+        );
         let mut out = [0u8; ENTRY_PAYLOAD];
         assert!(secretbox_decrypt(&mut out, &ct, &CTX_SECRET, &key));
         assert_eq!(out, msg);
@@ -260,7 +280,10 @@ mod tests {
         bad[SECRETBOX_HEADERBYTES] ^= 0x01;
         let mut out = [0xaau8; ENTRY_PAYLOAD];
         assert!(!secretbox_decrypt(&mut out, &bad, &CTX_SECRET, &key));
-        assert_eq!(out, [0u8; ENTRY_PAYLOAD], "C must zero the buffer on failure");
+        assert_eq!(
+            out, [0u8; ENTRY_PAYLOAD],
+            "C must zero the buffer on failure"
+        );
 
         // Flip one MAC bit.
         let mut bad_mac = ct;
@@ -292,7 +315,11 @@ mod tests {
         // Distinct buffers with equal content: exercises the C path.
         let a = b"abc".to_vec();
         let b = b"abc".to_vec();
-        assert_ne!(a.as_ptr(), b.as_ptr(), "test setup: buffers must be distinct");
+        assert_ne!(
+            a.as_ptr(),
+            b.as_ptr(),
+            "test setup: buffers must be distinct"
+        );
         assert!(equal(&a, &b));
 
         assert!(!equal(&a, b"abd"));
