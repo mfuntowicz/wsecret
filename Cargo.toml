@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["crates/libhydrogen-sys", "crates/wsecret-core", "crates/wsecret-cli"]
+
+[workspace.dependencies]
+cc = "=1.11.2"
