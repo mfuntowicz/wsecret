@@ -257,7 +257,7 @@ The future WinUI 3 C ABI is a design contract only; **no C ABI crate or GUI appl
 | `crates/libhydrogen-sys/` | Pinned libhydrogen C, safe Rust wrapper, and upstream KATs |
 | `crates/wsecret-core/` | Store format, sessions, cryptography dispatch, Windows security, and core tests |
 | `crates/wsecret-cli/` | `wsecret.exe`, console/agent behavior, and CLI acceptance tests |
-| `wsecret-src/` | Pinned upstream reference sources for compatibility oracles |
+| `fixtures/upstream/` | Minimal pinned upstream sources required by compatibility oracles |
 | `fixtures/` | Store fixtures, manifests, oracle tools, and filesystem evidence |
 
 ## Pinned upstream revisions
@@ -270,6 +270,6 @@ The future WinUI 3 C ABI is a design contract only; **no C ABI crate or GUI appl
 
 Preserve the applicable notices when redistributing source or binaries:
 
-- Upstream `secret`: BSD-2-Clause — `wsecret-src/LICENSE`
-- `argz`: `wsecret-src/LICENSE.argz`
+- Upstream `secret`: BSD-2-Clause — `fixtures/upstream/LICENSE`
+- `argz`: `fixtures/upstream/LICENSE.argz`
 - libhydrogen: ISC — `crates/libhydrogen-sys/vendor/LICENSE`

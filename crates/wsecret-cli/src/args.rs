@@ -1,9 +1,9 @@
 //! `argz`-exact command-line parser for `wsecret`.
 //!
 //! This module reproduces the dispatch semantics of the pinned upstream
-//! parser and command table verbatim (`wsecret-src/argz.c` @
+//! parser and command table verbatim (`fixtures/upstream/argz.c` @
 //! `9aeb9e035c80236dfc86c2b3bd124044419d9531` and the `struct argz z[]` table
-//! and command bodies in `wsecret-src/secret.c` @
+//! and command bodies in `fixtures/upstream/secret.c` @
 //! `e98103def4e062a6f9a8fa5e7693abe15f20817a`), mapped to u32 Windows exit
 //! codes ([`EXIT_OK`] / [`EXIT_FATAL`] / [`EXIT_USAGE`] / [`EXIT_HELP`], plan
 //! §4). No store I/O, prompting, or output encoding lives here: [`Dispatch`]

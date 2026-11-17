@@ -2,7 +2,7 @@
 """Linux-side upstream oracle helper (runs inside WSL).
 
 Drives the PINNED upstream `secret` binary (angt/secret @
-e98103def4e062a6f9a8fa5e7693abe15f20817a, vendored at `wsecret-src/`) over a
+e98103def4e062a6f9a8fa5e7693abe15f20817a, vendored at `fixtures/upstream/`) over a
 pty so that the upstream `/dev/tty` passphrase prompts work while stdin
 carries byte-exact secret values and stdout carries byte-exact results.
 
@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-REPO = "/mnt/f/Workspace/wsecret"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE = os.path.expanduser("~/.cache/wsecret-oracle")
 UP_SRC = os.path.join(CACHE, "src")
 SECRET = os.path.join(CACHE, "secret")
@@ -92,10 +92,10 @@ def ensure_upstream():
     def stage():
         os.makedirs(os.path.join(UP_SRC, "argz"), exist_ok=True)
         os.makedirs(os.path.join(UP_SRC, "libhydrogen"), exist_ok=True)
-        shutil.copyfile(os.path.join(REPO, "wsecret-src", "secret.c"),
+        shutil.copyfile(os.path.join(REPO, "fixtures", "upstream", "secret.c"),
                         os.path.join(UP_SRC, "secret.c"))
         for f in ("argz.c", "argz.h"):
-            shutil.copyfile(os.path.join(REPO, "wsecret-src", f),
+            shutil.copyfile(os.path.join(REPO, "fixtures", "upstream", f),
                             os.path.join(UP_SRC, "argz", f))
         for f in ("hydrogen.c", "hydrogen.h"):
             shutil.copyfile(os.path.join(REPO, "crates", "libhydrogen-sys", "vendor", f),

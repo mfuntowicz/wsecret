@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 
-REPO = "/mnt/f/Workspace/wsecret"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 CACHE = os.path.expanduser("~/.cache/wsecret-oracle")
 UP_SRC = os.path.join(CACHE, "src")
 SECRET = os.path.join(CACHE, "secret")
@@ -55,10 +55,10 @@ def ensure_upstream():
     log("building pinned upstream secret ...")
     os.makedirs(os.path.join(UP_SRC, "argz"), exist_ok=True)
     os.makedirs(os.path.join(UP_SRC, "libhydrogen"), exist_ok=True)
-    shutil.copyfile(os.path.join(REPO, "wsecret-src", "secret.c"),
+    shutil.copyfile(os.path.join(REPO, "fixtures", "upstream", "secret.c"),
                     os.path.join(UP_SRC, "secret.c"))
     for f in ("argz.c", "argz.h"):
-        shutil.copyfile(os.path.join(REPO, "wsecret-src", f),
+        shutil.copyfile(os.path.join(REPO, "fixtures", "upstream", f),
                         os.path.join(UP_SRC, "argz", f))
     for f in ("hydrogen.c", "hydrogen.h"):
         shutil.copyfile(os.path.join(REPO, "crates", "libhydrogen-sys", "vendor", f),

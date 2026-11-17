@@ -351,13 +351,29 @@ pub fn upstream_show(name: &str) -> Option<Vec<u8>> {
     Some((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex")).collect())
 }
 
+/// Repository-local oracle script expressed as a WSL mount path. Running the
+/// checked-in file directly prevents a stale ~/.cache script from selecting
+/// different upstream sources than the current checkout.
+fn oracle_script() -> String {
+    let win = workspace_root()
+        .join("fixtures")
+        .join("tools")
+        .join("linux_oracle.py");
+    let text = win.display().to_string();
+    let mut chars = text.chars();
+    let drive = chars.next().expect("drive letter").to_ascii_lowercase();
+    let rest: String = chars.collect();
+    let rest = rest.strip_prefix(':').unwrap_or(&rest).replace('\\', "/");
+    format!("/mnt/{drive}{rest}")
+}
+
 fn upstream_oracle(args: &[&str]) -> Option<String> {
     let mut probe = Command::new("wsl.exe");
     probe.args(["--", "echo", "WSL-OK"]);
     if probe.output().map(|o| !o.status.success()).unwrap_or(true) {
         return None;
     }
-    let mut script = String::from("python3 ~/.cache/wsecret-oracle/oracle.py");
+    let mut script = format!("python3 {}", oracle_script());
     for a in args {
         script.push(' ');
         script.push_str(a);
