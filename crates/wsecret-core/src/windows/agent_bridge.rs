@@ -691,7 +691,10 @@ fn quote_arg(arg: &std::ffi::OsStr) -> Vec<u16> {
 /// `CreateProcessW` contract requires. Hidden `=C:`-style drive-cwd entries
 /// are preserved. The block is returned as owned wide chars (double-NUL
 /// terminated).
-fn build_env_block(handle_value: usize) -> io::Result<Vec<u16>> {
+fn build_env_block(
+    handle_value: usize,
+    extra: Option<(&std::ffi::OsStr, &std::ffi::OsStr)>,
+) -> io::Result<Vec<u16>> {
     // SAFETY: returns a block owned by the process until freed below.
     let raw = unsafe { GetEnvironmentStringsW() };
     if raw.is_null() {
@@ -729,6 +732,20 @@ fn build_env_block(handle_value: usize) -> io::Result<Vec<u16>> {
     agent.push(u16::from(b'='));
     agent.extend(handle_value.to_string().encode_utf16());
     entries.push(agent);
+    if let Some((name, value)) = extra {
+        let name_w: Vec<u16> = name.encode_wide().collect();
+        entries.retain(|e| {
+            let n = e
+                .iter()
+                .position(|&c| c == u16::from(b'='))
+                .unwrap_or(e.len());
+            !(n == name_w.len() && fold_case(&e[..n]) == fold_case(&name_w))
+        });
+        let mut entry = name_w;
+        entry.push(u16::from(b'='));
+        entry.extend(value.encode_wide());
+        entries.push(entry);
+    }
     // Case-insensitive Unicode order (fold A-Z, compare ordinally).
     entries.sort_by(|a, b| fold_case(a).cmp(&fold_case(b)));
 
@@ -770,6 +787,18 @@ pub fn spawn_trusted_child(
     argv: &[&std::ffi::OsStr],
     pipe: AgentPipe,
 ) -> Result<AgentChild, io::Error> {
+    spawn_trusted_child_with_env(application, argv, pipe, None)
+}
+
+/// [`spawn_trusted_child`] with one additional environment entry (used for
+/// `SSH_AUTH_SOCK`). Birth hardening, capability handoff, and handle hygiene
+/// are identical to the base launcher.
+pub fn spawn_trusted_child_with_env(
+    application: &std::ffi::OsStr,
+    argv: &[&std::ffi::OsStr],
+    pipe: AgentPipe,
+    extra: Option<(&std::ffi::OsStr, &std::ffi::OsStr)>,
+) -> Result<AgentChild, io::Error> {
     // Command line: argv[0] as typed + arguments, properly quoted.
     let mut cmdline: Vec<u16> = Vec::new();
     for (i, a) in argv.iter().enumerate() {
@@ -784,7 +813,7 @@ pub fn spawn_trusted_child(
         .chain(std::iter::once(0))
         .collect();
 
-    let env_block = build_env_block(pipe.handle_value())?;
+    let env_block = build_env_block(pipe.handle_value(), extra)?;
     // Construct birth descriptors BEFORE any raw handle/list allocations so a
     // descriptor failure cannot leak those resources.
     let birth = ProcessBirthSecurity::new()

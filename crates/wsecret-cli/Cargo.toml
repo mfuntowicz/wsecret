@@ -20,6 +20,10 @@ wsecret-core = { path = "../wsecret-core" }
 # (`hydro_equal`), both verbatim upstream C (plan: no cryptography in Rust).
 # wsecret-core deliberately exposes no RNG/equality API.
 libhydrogen-sys = { path = "../libhydrogen-sys" }
+# Standard Ed25519 key generation only. The Microsoft ssh-agent performs all
+# SSH signatures; no private key is ever written to disk.
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
 # Raw stdout writes (`write_stdout`) need the console handle + WriteFile;
 # no CRT text mode, no CRLF/code-page conversion, no BOM (plan §4).
 windows-sys = { version = "=0.61.2", features = [

@@ -35,6 +35,7 @@
 mod agent;
 mod console;
 mod output;
+mod ssh_agent;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
@@ -50,6 +51,7 @@ use wsecret_core::windows::agent_bridge::sessions_same_key;
 
 use crate::agent::AgentLaunchError;
 use crate::console::ConsoleError;
+use crate::ssh_agent::SshAgentError;
 
 /// Upstream `s_ask_pass("Passphrase: ")`.
 const PROMPT_PASSPHRASE: &str = agent::PROMPT_PASSPHRASE;
@@ -335,6 +337,14 @@ trait Platform {
         cmd: &[&OsStr],
         pass_hex: bool,
     ) -> Result<i32, AgentLaunchError>;
+    /// Store-backed Ed25519 agent launch (`ssh-agent KEY [CMD...]`).
+    fn ssh_agent_launch(
+        &mut self,
+        store_path: &Path,
+        key: &[u8],
+        cmd: &[&OsStr],
+        pass_hex: bool,
+    ) -> Result<i32, SshAgentError>;
     /// Upstream `getenv(S_ENV_AGENT)` presence test used by `init`.
     fn agent_env_set(&self) -> bool;
 }
@@ -382,6 +392,20 @@ impl Platform for RealPlatform {
                 .map_err(|e| io::Error::other(e.to_string()))
         };
         agent::launch(store_path, cmd, &mut prompt)
+    }
+
+    fn ssh_agent_launch(
+        &mut self,
+        store_path: &Path,
+        key: &[u8],
+        cmd: &[&OsStr],
+        pass_hex: bool,
+    ) -> Result<i32, SshAgentError> {
+        let mut prompt = |p: &str| -> io::Result<Vec<u8>> {
+            self.read_passphrase(p, pass_hex)
+                .map_err(|e| io::Error::other(e.to_string()))
+        };
+        ssh_agent::launch(store_path, key, cmd, &mut prompt)
     }
 
     fn agent_env_set(&self) -> bool {
@@ -848,6 +872,72 @@ impl<P: Platform> Ctx<P> {
         }
     }
 
+    /// `ssh-keygen KEY`: generate an Ed25519 keypair in memory, store the
+    /// 64-byte secret key, and print ONLY the OpenSSH public-key line.
+    fn run_ssh_keygen(&mut self, key: &[u8]) -> Outcome {
+        let mut unlocked = match self.open_session(true, true) {
+            Ok(unlocked) => unlocked,
+            Err(outcome) => return outcome,
+        };
+        let Unlocked { store, session } = &mut unlocked;
+        let mut store = match store.lock_writers_scoped() {
+            Ok(store) => store,
+            Err(error) => return self.error(&error),
+        };
+        let (tombstone, decrypted_any) = match store.find(session, key, true) {
+            Err(Error::Name(NameError::Exists)) => {
+                return Outcome::fatal(msg_secret_exists(key));
+            }
+            Err(e) => return self.error(&e),
+            Ok(ScanOutcome::Found { .. }) => {
+                return Outcome::fatal(msg_secret_exists(key));
+            }
+            Ok(ScanOutcome::NotFound {
+                tombstone,
+                decrypted_any,
+            }) => (tombstone, decrypted_any),
+        };
+        if !decrypted_any {
+            if let Err(outcome) = self.confirm_partition(session) {
+                return outcome;
+            }
+        }
+
+        let (public, mut generated) = ssh_agent::generate_ed25519();
+        let secret = SecretBytes::from_slice(&generated);
+        libhydrogen_sys::memzero(&mut generated);
+        let secret = match secret {
+            Ok(secret) => secret,
+            Err(error) => return self.error(&error),
+        };
+        let line = ssh_agent::public_key_line(&public, key);
+        if let Err(outcome) = self.write_stdout(&line) {
+            return outcome;
+        }
+        match store.append_or_reuse(tombstone, session, key, secret.as_slice()) {
+            Ok(_) => Outcome::Code(EXIT_OK),
+            Err(failure) => self.commit_error(&failure),
+        }
+    }
+
+    /// `ssh-agent KEY [CMD [ARG...]]`: add the stored Ed25519 key to the
+    /// Windows agent, launch the trusted child, and remove it on clean exit.
+    fn run_ssh_agent(&mut self, key: &[u8]) -> Outcome {
+        let cmd: Vec<&OsStr> = self.agent_cmd.iter().map(OsString::as_os_str).collect();
+        match self
+            .platform
+            .ssh_agent_launch(&self.store_path, key, &cmd, self.pass_hex)
+        {
+            Ok(code) => Outcome::Code(code as u32),
+            Err(SshAgentError::Cancelled) => Outcome::Silent,
+            Err(SshAgentError::Core(e)) => self.error(&e),
+            Err(e) => match e.message() {
+                Some(body) => Outcome::fatal(body.into_bytes()),
+                None => Outcome::Silent,
+            },
+        }
+    }
+
     /// `version`: exactly `0.21\n` (byte parity; plan §4).
     fn run_version(&mut self) -> Outcome {
         let text = format!("{}.{}\n", VERSION.0, VERSION.1);
@@ -881,6 +971,8 @@ impl<P: Platform> Ctx<P> {
             Command::Update { key, new_key } => self.run_update(key, new_key),
             Command::Pass { keys } => self.run_pass(keys),
             Command::Agent { .. } => self.run_agent(),
+            Command::SshKeygen { key } => self.run_ssh_keygen(key),
+            Command::SshAgent { key, .. } => self.run_ssh_agent(key),
             Command::Version => self.run_version(),
         }
     }
@@ -944,7 +1036,16 @@ fn strip_flags(mut raw: Vec<OsString>) -> (Vec<OsString>, Flags) {
 /// (`--keys-hex` decodes them; `help` is kept literal so the help matrix
 /// still works under the mode).
 const KEY_COMMANDS: &[&[u8]] = &[
-    b"list", b"show", b"dump", b"new", b"set", b"renew", b"update", b"pass",
+    b"list",
+    b"show",
+    b"dump",
+    b"new",
+    b"set",
+    b"renew",
+    b"update",
+    b"pass",
+    b"ssh-keygen",
+    b"ssh-agent",
 ];
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -980,7 +1081,7 @@ fn encode_argv(words: &[OsString], keys_hex: bool) -> Result<Vec<Vec<u8>>, Vec<u
             && raw != b"help"
             && words.get(1).is_some_and(|cmd| {
                 let cmd = cmd.as_encoded_bytes();
-                KEY_COMMANDS.contains(&cmd)
+                KEY_COMMANDS.contains(&cmd) && (index == 2 || cmd != b"ssh-agent")
             });
         if decode {
             out.push(decode_hex(raw).ok_or_else(msg_invalid_input)?);
@@ -1071,15 +1172,13 @@ fn run_main(raw: Vec<OsString>, mut platform: impl Platform) -> u32 {
         }
     };
     let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-    // `agent` takes its command words as original `OsString`s (byte-exact
-    // for `CreateProcessW`); everything else runs on the encoded bytes.
-    let agent_cmd = if words
-        .get(1)
-        .is_some_and(|cmd| cmd.as_encoded_bytes() == b"agent")
-    {
-        words[2..].to_vec()
-    } else {
-        Vec::new()
+    // `agent` and `ssh-agent` take their child command words as original
+    // `OsString`s (byte-exact for `CreateProcessW`); everything else runs on
+    // the encoded bytes. `ssh-agent` additionally has a key operand to skip.
+    let agent_cmd = match words.get(1).map(|word| word.as_encoded_bytes()) {
+        Some(b"agent") => words[2..].to_vec(),
+        Some(b"ssh-agent") => words[3..].to_vec(),
+        _ => Vec::new(),
     };
     let stdout_is_tty = platform.stdout_is_console();
     let mut dispatcher = Dispatcher {
@@ -1119,6 +1218,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use wsecret_core::error::AgentError;
     use wsecret_core::format::OPS_LIMIT_MIN;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1302,6 +1402,30 @@ mod tests {
                 LaunchScript::Cancelled => Err(AgentLaunchError::Cancelled),
                 LaunchScript::Mismatch => Err(AgentLaunchError::PassphraseMismatch),
                 LaunchScript::StoreMissing => Err(AgentLaunchError::Core(Error::StoreNotFound)),
+            }
+        }
+
+        fn ssh_agent_launch(
+            &mut self,
+            _store_path: &Path,
+            _key: &[u8],
+            _cmd: &[&OsStr],
+            _pass_hex: bool,
+        ) -> Result<i32, SshAgentError> {
+            match self.launch.clone() {
+                LaunchScript::Code(code) => Ok(code),
+                LaunchScript::AlreadyRunning => Err(SshAgentError::AlreadyRunning),
+                LaunchScript::MissingShell => Err(SshAgentError::MissingShell),
+                LaunchScript::QueueKey => {
+                    Err(SshAgentError::Core(Error::Agent(AgentError::Unavailable)))
+                }
+                LaunchScript::Exec(name, error) => Err(SshAgentError::Exec {
+                    name: name.to_owned(),
+                    error: io::Error::other(error),
+                }),
+                LaunchScript::Cancelled => Err(SshAgentError::Cancelled),
+                LaunchScript::Mismatch => Err(SshAgentError::Core(Error::PassphraseMismatch)),
+                LaunchScript::StoreMissing => Err(SshAgentError::Core(Error::StoreNotFound)),
             }
         }
 

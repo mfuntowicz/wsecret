@@ -63,7 +63,7 @@ const ARGZ_LEN: usize = 14;
 const FATAL_CAP: usize = 256;
 
 /// The top-level command table in upstream `main()` order (`secret.c:914`).
-pub const COMMANDS: [(&str, &str); 11] = [
+pub const COMMANDS: [(&str, &str); 13] = [
     ("init", "Initialize secret"),
     ("list", "List all secrets for a given passphrase"),
     ("show", "Print a secret"),
@@ -74,6 +74,11 @@ pub const COMMANDS: [(&str, &str); 11] = [
     ("update", "Update an existing secret"),
     ("pass", "Print a deterministic secret"),
     ("agent", "Run a process in a trusted zone"),
+    (
+        "ssh-keygen",
+        "Generate an Ed25519 SSH key without a key file",
+    ),
+    ("ssh-agent", "Use an Ed25519 key through Windows ssh-agent"),
     ("version", "Show version"),
 ];
 
@@ -115,6 +120,11 @@ pub enum Command<'a> {
     Pass { keys: &'a [&'a [u8]] },
     /// `agent [CMD [ARG…]]` — `cmd` empty means the `$SHELL` fallback.
     Agent { cmd: &'a [&'a [u8]] },
+    /// `ssh-keygen KEY` — generate and store an Ed25519 key in memory only.
+    SshKeygen { key: &'a [u8] },
+    /// `ssh-agent KEY [CMD [ARG…]]` — add the key to Windows ssh-agent,
+    /// launch the trusted child, and remove the identity on clean exit.
+    SshAgent { key: &'a [u8], cmd: &'a [&'a [u8]] },
     /// `version`.
     Version,
 }
@@ -257,9 +267,7 @@ fn strtoull_base0(s: &[u8]) -> Ull {
     }
     let mut base = 10u64;
     if i < s.len() && s[i] == b'0' {
-        if i + 2 < s.len()
-            && (s[i + 1] == b'x' || s[i + 1] == b'X')
-            && s[i + 2].is_ascii_hexdigit()
+        if i + 2 < s.len() && (s[i + 1] == b'x' || s[i + 1] == b'X') && s[i + 2].is_ascii_hexdigit()
         {
             base = 16;
             i += 2;
@@ -323,9 +331,10 @@ fn parse_ull(words: &[&[u8]]) -> UllResult {
                 return UllResult::Err(msg(b"is badly suffixed"));
             }
             if value < OPS_LIMIT_MIN {
-                return UllResult::Err(msg(
-                    format!("must be a number greater than or equal to {OPS_LIMIT_MIN}").as_bytes(),
-                ));
+                return UllResult::Err(msg(format!(
+                    "must be a number greater than or equal to {OPS_LIMIT_MIN}"
+                )
+                .as_bytes()));
             }
             UllResult::Value(value, 2)
         }
@@ -476,6 +485,16 @@ fn command_help(command: &'static str, argc: usize) -> HelpBranch {
             usage: "Usage: pass KEY [SUBKEY...]\n",
             names: NamesAction::None,
         },
+        "ssh-keygen" => HelpBranch {
+            command,
+            usage: "Usage: ssh-keygen KEY \n",
+            names: names(true),
+        },
+        "ssh-agent" => HelpBranch {
+            command,
+            usage: "Usage: ssh-agent KEY [CMD [ARG...]]\n",
+            names: names(true),
+        },
         // s_agent L792: `argz_help`; non-tty prints the literal `CMD`.
         "agent" => HelpBranch {
             command,
@@ -515,6 +534,11 @@ fn build_command<'a>(name: &str, rest: &'a [&'a [u8]]) -> Command<'a> {
         },
         "pass" => Command::Pass { keys: rest },
         "agent" => Command::Agent { cmd: rest },
+        "ssh-keygen" => Command::SshKeygen { key: rest[0] },
+        "ssh-agent" => Command::SshAgent {
+            key: rest[0],
+            cmd: &rest[1..],
+        },
         _ => unreachable!("no command body for {name}"),
     }
 }
@@ -595,6 +619,8 @@ pub fn parse<'a>(argv: &'a [&'a [u8]]) -> Outcome<'a> {
             "update" => (2..=3).contains(&argc_c),
             "pass" => argc_c >= 2,
             "agent" => true,
+            "ssh-keygen" => argc_c == 2,
+            "ssh-agent" => argc_c >= 2,
             _ => unreachable!("no arity rule for {name}"),
         };
         if !arity_ok {
@@ -748,7 +774,7 @@ mod tests {
         assert!(table.starts_with("  init            Initialize secret\n"));
         assert!(table.contains("  update          Update an existing secret\n"));
         assert!(table.ends_with("  version         Show version\n"));
-        assert_eq!(table.lines().count(), 11);
+        assert_eq!(table.lines().count(), 13);
     }
 
     // ---- parser-level `help` (exit 254) --------------------------------
@@ -826,58 +852,94 @@ mod tests {
     // ---- command recognition ------------------------------------------
 
     #[test]
-    fn all_eleven_commands_are_recognized() {
-        assert_cmd(&["init"], Command::Init {
-            ops_limit: OPS_LIMIT_DEFAULT,
-        });
+    fn all_thirteen_commands_are_recognized() {
+        assert_cmd(
+            &["init"],
+            Command::Init {
+                ops_limit: OPS_LIMIT_DEFAULT,
+            },
+        );
         assert_cmd(&["list"], Command::List { needle: None });
         assert_cmd(&["show", "k"], Command::Show { key: b"k" });
         assert_cmd(&["dump", "k"], Command::Dump { key: b"k" });
         assert_cmd(&["new", "k"], Command::New { key: b"k" });
         assert_cmd(&["set", "k"], Command::Set { key: b"k" });
         assert_cmd(&["renew", "k"], Command::Renew { key: b"k" });
-        assert_cmd(&["update", "k", "n"], Command::Update {
-            key: b"k",
-            new_key: Some(b"n"),
-        });
+        assert_cmd(
+            &["update", "k", "n"],
+            Command::Update {
+                key: b"k",
+                new_key: Some(b"n"),
+            },
+        );
         assert_cmd(&["pass", "k"], Command::Pass { keys: &[b"k"] });
         assert_cmd(&["agent"], Command::Agent { cmd: &[] });
+        assert_cmd(&["ssh-keygen", "k"], Command::SshKeygen { key: b"k" });
+        assert_cmd(
+            &["ssh-agent", "k"],
+            Command::SshAgent {
+                key: b"k",
+                cmd: &[],
+            },
+        );
+        assert_cmd(
+            &["ssh-agent", "k", "ssh", "host"],
+            Command::SshAgent {
+                key: b"k",
+                cmd: &[b"ssh", b"host"],
+            },
+        );
         assert_cmd(&["version"], Command::Version);
     }
 
     #[test]
     fn list_needle_is_the_second_word() {
-        assert_cmd(&["list", "NEEDLE"], Command::List {
-            needle: Some(b"NEEDLE"),
-        });
+        assert_cmd(
+            &["list", "NEEDLE"],
+            Command::List {
+                needle: Some(b"NEEDLE"),
+            },
+        );
     }
 
     #[test]
     fn update_key_only_and_rename_forms_are_distinguished() {
         // `update KEY` alone: empty input exits 0 with no write.
-        assert_cmd(&["update", "old"], Command::Update {
-            key: b"old",
-            new_key: None,
-        });
+        assert_cmd(
+            &["update", "old"],
+            Command::Update {
+                key: b"old",
+                new_key: None,
+            },
+        );
         // `update KEY NEWKEY`: empty input keeps the old value.
-        assert_cmd(&["update", "old", "new"], Command::Update {
-            key: b"old",
-            new_key: Some(b"new"),
-        });
+        assert_cmd(
+            &["update", "old", "new"],
+            Command::Update {
+                key: b"old",
+                new_key: Some(b"new"),
+            },
+        );
     }
 
     #[test]
     fn pass_chains_every_operand_including_key() {
-        assert_cmd(&["pass", "k", "a", "b"], Command::Pass {
-            keys: &[b"k", b"a", b"b"],
-        });
+        assert_cmd(
+            &["pass", "k", "a", "b"],
+            Command::Pass {
+                keys: &[b"k", b"a", b"b"],
+            },
+        );
     }
 
     #[test]
     fn agent_takes_cmd_and_args_with_shell_fallback() {
-        assert_cmd(&["agent", "cmd", "-x"], Command::Agent {
-            cmd: &[b"cmd", b"-x"],
-        });
+        assert_cmd(
+            &["agent", "cmd", "-x"],
+            Command::Agent {
+                cmd: &[b"cmd", b"-x"],
+            },
+        );
         assert_cmd(&["agent"], Command::Agent { cmd: &[] });
     }
 
@@ -996,10 +1058,7 @@ mod tests {
     #[test]
     fn table_conflicts_are_reported_like_argz_is_available() {
         // A leftover word that matches the already-set command:
-        assert_eq!(
-            err_of(&["init", "init"]),
-            b"Option init is already set"
-        );
+        assert_eq!(err_of(&["init", "init"]), b"Option init is already set");
         // A leftover word matching another command in the same group:
         assert_eq!(
             err_of(&["init", "version"]),
@@ -1058,9 +1117,18 @@ mod tests {
         assert_eq!(help_of(&["new", "help"]).usage, "Usage: new KEY \n");
         assert_eq!(help_of(&["set", "help"]).usage, "Usage: set KEY \n");
         assert_eq!(help_of(&["renew", "help"]).usage, "Usage: renew KEY \n");
-        assert_eq!(help_of(&["update", "help"]).usage, "Usage: update KEY NEWKEY\n");
-        assert_eq!(help_of(&["pass", "help"]).usage, "Usage: pass KEY [SUBKEY...]\n");
-        assert_eq!(help_of(&["agent", "help"]).usage, "Usage: agent CMD [ARG...]\n");
+        assert_eq!(
+            help_of(&["update", "help"]).usage,
+            "Usage: update KEY NEWKEY\n"
+        );
+        assert_eq!(
+            help_of(&["pass", "help"]).usage,
+            "Usage: pass KEY [SUBKEY...]\n"
+        );
+        assert_eq!(
+            help_of(&["agent", "help"]).usage,
+            "Usage: agent CMD [ARG...]\n"
+        );
     }
 
     #[test]

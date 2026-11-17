@@ -231,7 +231,7 @@ where
 /// `s_ask_pass` → `s_get_secret(NULL, 0)` retype). Any decryptable record
 /// passes; otherwise the passphrase is re-entered and both derivations are
 /// compared constant-time ([`agent_bridge::sessions_same_key`]).
-fn unlock_with_confirmation<F>(
+pub(crate) fn unlock_with_confirmation<F>(
     store: &mut Store,
     header: &Header,
     prompt: &mut F,

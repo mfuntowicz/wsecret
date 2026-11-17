@@ -117,8 +117,9 @@ requires a Win11 ARM64 host/runner and remains **pending**.
   process-creation subscription. P4e uses an unhardened native external
   launcher with a known retained child handle, not literal `cmd /c`; the OS
   handle-duplication path and documented residual are the same.
-- **Regression evidence:** core 93/93, CLI unit 140/140, crosscheck 15/15,
-  malformed-store 17/17, all on x64. No ARM64 runtime claim is made.
+- **Regression evidence:** core 96/96, CLI unit 140/140, crosscheck 15/15,
+  malformed-store 17/17, all on x64. The final full workspace run is
+  **364 tests across 15 suites**. No ARM64 runtime claim is made.
 
 ## Concurrent writers and crash model (Windows 11 x64 evidence)
 
@@ -139,3 +140,26 @@ requires a Win11 ARM64 host/runner and remains **pending**.
   slot-write model: torn slots are skipped, append suffixes are read-tolerated
   but mutation-rejected, partial init is unreadable, and no temporary file is
   created. The withdrawn atomic-replace wording is not used as an assertion.
+
+## Store-backed SSH agent (Windows 11 x64 evidence)
+
+- **Commands:** `wsecret ssh-keygen KEY` generates a standard Ed25519 keypair
+  with the pinned `ed25519-dalek` crate, stores the 64-byte `seed || public`
+  secret in the encrypted store, and prints only the OpenSSH public-key line.
+  `wsecret ssh-agent KEY [CMD ...]` sends that secret directly to the existing
+  Microsoft `ssh-agent` over `\\.\pipe\openssh-ssh-agent`, sets
+  `SSH_AUTH_SOCK` for the hardened child, and removes the identity on every
+  clean return path. The Microsoft agent performs all signatures.
+- **No local key dump:** add-key requests use `SecretBytes` and are wiped on
+  every return; no private key file, temporary export, or private-key stdout
+  is produced. The acceptance test scans every artifact it creates for the
+  private scalar and full 64-byte secret.
+- **Acceptance:** `cargo test -p wsecret-cli --test ssh_agent` — **2/2 PASS**.
+  Covers public-key-only generation and a real Windows-agent add/sign/remove
+  cycle. The returned signature is independently verified with OpenSSL
+  `pkeyutl -verify`; `ssh-add -l` observes the identity and post-exit removal.
+- **Limits:** Ed25519 only. The Windows `ssh-agent` service must be running.
+  `WSECRET_SSH_AGENT_PIPE` is an intentional endpoint override. Removal is
+  not guaranteed after a process kill; `ssh-add -D` remains the documented
+  recovery path. libhydrogen's `hydro_sign` construction is NOT OpenSSH
+  Ed25519-compatible and is not used for SSH keys or signatures.

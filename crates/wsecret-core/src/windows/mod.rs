@@ -8,3 +8,4 @@ pub mod agent_bridge;
 pub mod console;
 pub mod file;
 pub mod security;
+pub mod ssh_agent;
