@@ -1,0 +1,29 @@
+{
+  "rows": [
+    {
+      "filesystem": "NTFS",
+      "volumes": ["C:\", "D:\", "E:\", "F:\", "G:\"],
+      "evidence": ["C:\: short-write append → 512N+256 suffix, original intact", "C:\: kill before write → store byte-identical", "C:\: kill after write → complete new record visible (process-kill write-back; NO power-loss durability claim)", "D:\: short-write append → 512N+256 suffix, original intact", "D:\: kill before write → store byte-identical", "D:\: kill after write → complete new record visible (process-kill write-back; NO power-loss durability claim)", "E:\: short-write append → 512N+256 suffix, original intact", "E:\: kill before write → store byte-identical", "E:\: kill after write → complete new record visible (process-kill write-back; NO power-loss durability claim)", "F:\: short-write append → 512N+256 suffix, original intact", "F:\: kill before write → store byte-identical", "F:\: kill after write → complete new record visible (process-kill write-back; NO power-loss durability claim)", "G:\: short-write append → 512N+256 suffix, original intact", "G:\: kill before write → store byte-identical", "G:\: kill after write → complete new record visible (process-kill write-back; NO power-loss durability claim)"]
+    },
+    {
+      "filesystem": "ReFS",
+      "volumes": [],
+      "evidence": ["NO EVIDENCE — no ReFS volume on this host"]
+    },
+    {
+      "filesystem": "FAT32",
+      "volumes": [],
+      "evidence": ["NO EVIDENCE — no FAT32 volume on this host"]
+    },
+    {
+      "filesystem": "exFAT",
+      "volumes": [],
+      "evidence": ["NO EVIDENCE — no exFAT volume on this host"]
+    },
+    {
+      "filesystem": "SMB",
+      "volumes": [],
+      "evidence": ["NO EVIDENCE — no SMB share provisioned on this host (requires rights this environment lacks); the E7 drvfs-redirector row is the recorded cross-protocol evidence"]
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+[package]
+name = "wsecret-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Test-only fault-injection seams for the §5.6 mutation checkpoints (plan
+# §5.6 points 4-5, §7.3 C16/C16b, §7.4 U5/E-rows). Never enabled in
+# production builds: `cargo build --release` compiles the mutation path with
+# no injection code at all.
+fault-injection = []
+
+[dependencies]
+libhydrogen-sys = { path = "../libhydrogen-sys" }
+# Minimal feature set for the planned Windows work in `src/windows/`
+# (plan §3.1: file/ACL/mutex/pipe/process APIs + console prompting):
+# - Win32_Foundation:          handle/error primitives shared by all others
+# - Win32_Security:            DACLs for the store file and the writer mutex
+# - Win32_Storage_FileSystem:  CreateFileW/FlushFileBuffers/LockFileEx,
+#   reparse-point and file-identity checks
+# - Win32_System_Console:      CONIN$/CONOUT$ passphrase prompting
+# - Win32_System_IO:           OVERLAPPED-based I/O on handles
+# - Win32_System_Memory:      VirtualLock/VirtualUnlock secret-memory locking
+# - Win32_System_Pipes:        PeekNamedPipe for the agent capability bridge
+# - Win32_System_Threading:    CreateThread / named-mutex primitives
+# - Win32_Security_Cryptography: CryptProtectMemory/CryptUnprotectMemory
+#   (DPAPI key-at-rest encryption, session.rs / plan §5.3)
+# - Win32_System_ErrorReporting: Wer(Un)RegisterExcludedMemoryBlock
+#   (best-effort WER dump exclusion, session.rs / plan §5.3)
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_ErrorReporting",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# Fixture generator only (`examples/gen_fixtures.rs`, plan §7.2): SHA-256 for
+# the fixture manifest's integrity hashes. Not part of the shipped library or
+# CLI dependency set.
+sha2 = "=0.10.9"
+
+# Fault-injection acceptance targets (plan §7.3 C16/C16b, §7.4 U5/E-rows/R2-A):
+# they exercise the `fault-injection` test seams and the §5.8 residency hooks
+# and are skipped with a visible required-features note when the feature is
+# off. `cargo test --workspace` enables the feature through wsecret-cli's
+# dev-dependency; `cargo test -p wsecret-core --features fault-injection`
+# runs them directly. Production builds never enable the feature.
+[[test]]
+name = "commit_state"
+required-features = ["fault-injection"]
+
+[[test]]
+name = "crash_consistency"
+required-features = ["fault-injection"]
+
+[[test]]
+name = "residency_r2a"
+harness = false
+required-features = ["fault-injection"]
