@@ -1,0 +1,41 @@
+{
+  "schema": "wsecret.fixtures.upstream-origin/1",
+  "file": "upstream-linux-origin.secret",
+  "sha256": "59a42aba6c4df1e448bce323011aa9b12d2724b79117fb83f0a4fed0e087d4f4",
+  "bytes": 4608,
+  "blocks": 9,
+  "origin": "REAL upstream-origin fixture: generated on Linux (Fedora 44, WSL2, x64) by the pinned upstream `secret` binary built from `wsecret-src/` (angt/secret @ e98103def4e062a6f9a8fa5e7693abe15f20817a, libhydrogen @ 6c58976b3b9178441218c12bca2cc414d9efe30d — vendored sources verified byte-identical to `crates/libhydrogen-sys/vendor/` by sha256 before the build)",
+  "generator": {
+    "path": "fixtures/tools/linux_oracle.py",
+    "command": "python3 linux_oracle.py generate (run inside WSL against a pty, so the upstream /dev/tty passphrase prompts work while stdin carries byte-exact values)",
+    "self_check": "the generator re-reads every record with the upstream tool itself (`list` both partitions, `dump` all 8 records) and asserts byte-exact values before emitting the store"
+  },
+  "upstream_commands": {
+    "note": "Exactly the `upstream_commands.linux_origin` sequence of `fixtures/stores/manifest.json`, executed for real: prompts are interactive on /dev/tty; P_A = 'correct horse battery staple' (steps 2-7, with new-partition confirmation on step 2), P_B = 'second' (steps 8-10, confirmation on step 8). SECRET_AGENT unset.",
+    "build": "gcc -O2 -o secret secret.c  (from wsecret-src/secret.c + argz + vendored libhydrogen, in WSL)",
+    "commands": [
+      "./secret init opslimit 100000",
+      "printf 'hello\\n' | ./secret set test",
+      "printf '\\000..\\037' | ./secret set mykey",
+      "printf '12345678901234567890' | ./secret set test/totp",
+      "printf 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\\n' | ./secret set test/totp32",
+      "printf 'old\\n' | ./secret set test-old",
+      "printf '' | ./secret update test-old DELETED:test",
+      "printf 'beta one\\n' | ./secret set b1",
+      "printf 'beta two\\n' | ./secret set b2",
+      "printf 256 bytes 0x00..0xff | ./secret set b3"
+    ]
+  },
+  "entries": [
+    { "slot": 1, "byte_offset": 512, "name": "test", "value_hex": "68656c6c6f0a", "passphrase": "P_A" },
+    { "slot": 2, "byte_offset": 1024, "name": "mykey", "value_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "passphrase": "P_A" },
+    { "slot": 3, "byte_offset": 1536, "name": "test/totp", "value_hex": "3132333435363738393031323334353637383930", "passphrase": "P_A" },
+    { "slot": 4, "byte_offset": 2048, "name": "test/totp32", "value_hex": "47455a44474e425647593354514f4a5147455a44474e425647593354514f4a510a", "passphrase": "P_A" },
+    { "slot": 5, "byte_offset": 2560, "name": "DELETED:test", "value_hex": "6f6c640a", "passphrase": "P_A" },
+    { "slot": 6, "byte_offset": 3072, "name": "b1", "value_hex": "62657461206f6e650a", "passphrase": "P_B" },
+    { "slot": 7, "byte_offset": 3584, "name": "b2", "value_hex": "626574612074776f0a", "passphrase": "P_B" },
+    { "slot": 8, "byte_offset": 4096, "name": "b3", "value_hex": "00..ff (256 bytes)", "passphrase": "P_B" }
+  ],
+  "store_parameters": { "ops_limit": 100000, "format_version": 0, "block_bytes": 512 },
+  "consumers": "crates/wsecret-cli/tests/crosscheck.rs (via harness::linux_origin_fixture) cross-checks dump/list/show byte-exactness against this store; the in-window TOTP parity check runs the same upstream binary via `fixtures/tools/linux_oracle.py show NAME` on the WSL copy of this store."
+}
