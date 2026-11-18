@@ -67,6 +67,12 @@ pub enum UnlockEvidence {
 /// Not `Clone`/`Copy`; `Debug` is redacted. `Send` (ownership moves with
 /// the value) but deliberately **not** `Sync` (the raw pointer makes it
 /// `!Sync` automatically).
+///
+/// Buffer ownership: this is THE owner of decrypted secret bytes in the
+/// crate — record values returned by `store::Store::find` and transient
+/// renders in the CLI layer. Secret plaintext must never escape as an
+/// ordinary `Vec`/`String`; borrow with [`SecretBytes::as_slice`], mutate
+/// with [`SecretBytes::as_mut_slice`], and let drop (or `clear`) erase it.
 pub struct SecretBytes {
     ptr: *mut u8,
     len: usize,
@@ -730,6 +736,20 @@ mod tests {
         assert!(buf.is_empty());
         // Idempotent.
         buf.clear();
+    }
+
+    #[test]
+    fn secret_bytes_debug_is_redacted() {
+        let buf = SecretBytes::from_slice(b"super-secret").expect("alloc");
+        let dbg = format!("{buf:?}");
+        assert!(
+            dbg.contains("redacted"),
+            "Debug must render redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains("super-secret"),
+            "secret bytes must not appear in Debug: {dbg}"
+        );
     }
 
     #[test]

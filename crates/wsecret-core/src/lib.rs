@@ -19,5 +19,5 @@ pub use error::{
     CommitFailure, CommitOutcome, CommitReceipt, CommitState, Error, FormatError, NameError,
 };
 pub use format::Header;
-pub use session::Session;
-pub use store::{Limits, ScanOutcome, Store};
+pub use session::{SecretBytes, Session};
+pub use store::{Limits, ScanMeta, ScanOutcome, Store};

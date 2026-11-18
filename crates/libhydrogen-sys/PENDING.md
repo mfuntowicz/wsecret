@@ -141,7 +141,7 @@ requires a Win11 ARM64 host/runner and remains **pending**.
   but mutation-rejected, partial init is unreadable, and no temporary file is
   created. The withdrawn atomic-replace wording is not used as an assertion.
 
-## Store-backed SSH agent (Windows 11 x64 evidence)
+## Store-backed SSH agent (pre-audit Windows 11 x64 evidence)
 
 - **Commands:** `wsecret ssh keygen KEY` generates a standard Ed25519 keypair
   with the pinned `ed25519-dalek` crate, stores the 64-byte `seed || public`
@@ -158,8 +158,8 @@ requires a Win11 ARM64 host/runner and remains **pending**.
   Covers public-key-only generation and a real Windows-agent add/sign/remove
   cycle. The returned signature is independently verified with OpenSSL
   `pkeyutl -verify`; `ssh-add -l` observes the identity and post-exit removal.
-- **Limits:** Ed25519 only. The Windows `ssh-agent` service must be running.
-  `WSECRET_SSH_AGENT_PIPE` is an intentional endpoint override. Removal is
-  not guaranteed after a process kill; `ssh-add -D` remains the documented
-  recovery path. libhydrogen's `hydro_sign` construction is NOT OpenSSH
-  Ed25519-compatible and is not used for SSH keys or signatures.
+- **Scope:** these results describe the pre-remediation build. They do not
+  establish endpoint authentication, SSH-child vault isolation, or ownership
+  on cleanup. See the current policies and verification in the root README.
+  libhydrogen's `hydro_sign` construction is not OpenSSH Ed25519-compatible
+  and is not used for SSH keys or signatures.

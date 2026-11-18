@@ -11,10 +11,17 @@
 //! 1. Refuse when `SECRET_AGENT` is already set (upstream: `Fatal: Already
 //!    running...`; `init` uses the same refusal).
 //! 2. Resolve the executable to a full path — the first `CMD` argument if
-//!    given, else `$SHELL`, else `%ComSpec%`; the resolved path is passed as
-//!    explicit `lpApplicationName` (no `CreateProcessW` command-line parsing
-//!    ambiguity), while the child's `argv[0]` stays exactly as typed
-//!    (upstream `execvp` semantics).
+//!    given, else `$SHELL`, else `%ComSpec%` — and existence-validate it
+//!    BEFORE the store is opened and before any prompt (WS-02). The strict
+//!    resolver ([`wsecret_core::windows::agent_bridge::resolve_executable`])
+//!    trusts bare names only in the WinAPI-derived system directories; an
+//!    explicit local fully qualified path must exist; relative/current-dir,
+//!    namespace, UNC, drive-relative, device and otherwise ambiguous names
+//!    are fatal — the `SHELL`/`ComSpec` fallback values are held to exactly
+//!    the same rules (never trusted against the current directory). The
+//!    resolved path is passed as explicit `lpApplicationName` (no
+//!    `CreateProcessW` command-line parsing ambiguity), while the child's
+//!    `argv[0]` stays exactly as typed (upstream `execvp` semantics).
 //! 3. Unlock the store through the normal library path, **including the
 //!    no-records confirmation** (upstream `s_get_secret(fd, NULL, 0)`:
 //!    any decryptable record passes; otherwise the passphrase is re-entered
@@ -74,7 +81,7 @@ use std::path::Path;
 use wsecret_core::error::Error;
 use wsecret_core::format::Header;
 use wsecret_core::session::Session;
-use wsecret_core::store::Store;
+use wsecret_core::store::{Limits, Store};
 use wsecret_core::windows::agent_bridge::{
     self, AgentCapability, AgentChild, AgentPipe, ENV_AGENT,
 };
@@ -169,7 +176,18 @@ fn acquire_from_value(value: &OsStr, header: &Header) -> Option<Session> {
 /// entered bytes **without** the trailing newline (upstream `s_input` strips
 /// it and rejects control characters); an empty return aborts like upstream's
 /// `s_exit(0)` → [`AgentLaunchError::Cancelled`].
-pub fn launch<F>(store_path: &Path, cmd: &[&OsStr], mut prompt: F) -> Result<i32, AgentLaunchError>
+///
+/// `limits` is the launcher's OWN store-open policy (WS-06): it bounds only
+/// the parent's open/unlock above and is never inherited by the child — not
+/// through argv, not through the environment. A trusted child that wants the
+/// expensive-KDF override must pass `--allow-expensive-kdf` in its own
+/// leading position.
+pub fn launch<F>(
+    store_path: &Path,
+    cmd: &[&OsStr],
+    limits: Limits,
+    mut prompt: F,
+) -> Result<i32, AgentLaunchError>
 where
     F: FnMut(&str) -> std::io::Result<Vec<u8>>,
 {
@@ -178,8 +196,13 @@ where
         return Err(AgentLaunchError::AlreadyRunning);
     }
 
-    // Step 2: the child's program and argv. With no command the shell runs
-    // with argv0 only (upstream `char *args[] = {shell, NULL}`).
+    // Step 2: the child's program and argv, resolved and existence-validated
+    // IMMEDIATELY (WS-02) — before the store is opened and before any
+    // passphrase prompt. With no command the shell runs with argv0 only
+    // (upstream `char *args[] = {shell, NULL}`); the `SHELL`/`ComSpec`
+    // fallback values pass through the same strict resolver, so a relative or
+    // untrusted fallback is fatal here — never accidentally trusted against
+    // the current directory.
     let shell_storage;
     let argv: Vec<&OsStr> = if !cmd.is_empty() {
         cmd.to_vec()
@@ -191,10 +214,16 @@ where
     };
     let program = argv[0];
     let program_name = program.to_string_lossy().into_owned();
+    let app =
+        agent_bridge::resolve_executable(program).map_err(|error| AgentLaunchError::Exec {
+            name: program_name.clone(),
+            error,
+        })?;
 
     // Step 3: unlock through the normal library path, including the
     // no-records confirmation (upstream `s_open_secret` + `s_get_secret`).
-    let (mut store, header) = Store::open_read(store_path).map_err(AgentLaunchError::Core)?;
+    let (mut store, header) =
+        Store::open_read_with_limits(store_path, limits).map_err(AgentLaunchError::Core)?;
     let mut session = unlock_with_confirmation(&mut store, &header, &mut prompt)?;
 
     // Steps 4–6: capability (secure buffer) → empty-DACL pipe → exact write
@@ -208,15 +237,10 @@ where
     pipe.mark_read_inheritable()
         .map_err(AgentLaunchError::Core)?;
 
-    // Steps 7–9: explicit lpApplicationName (resolved full path), restricted
-    // inheritance, handle hygiene and immediate teardown all happen inside
-    // `spawn_trusted_child`; the returned `AgentChild` holds only the reduced
-    // handle and waits through it.
-    let app =
-        agent_bridge::resolve_executable(program).map_err(|error| AgentLaunchError::Exec {
-            name: program_name.clone(),
-            error,
-        })?;
+    // Steps 7–9: explicit lpApplicationName (the step-2 resolved and
+    // validated path), restricted inheritance, handle hygiene and immediate
+    // teardown all happen inside `spawn_trusted_child`; the returned
+    // `AgentChild` holds only the reduced handle and waits through it.
     let child: AgentChild =
         agent_bridge::spawn_trusted_child(&app, &argv, pipe).map_err(|error| {
             AgentLaunchError::Exec {
@@ -442,7 +466,9 @@ mod tests {
         }
         // The adopter (attacker key holder) reads the new record freely.
         match store.find(&adopted, b"new", false).expect("adopted scan") {
-            ScanOutcome::Found { value, .. } => assert_eq!(value, b"attacker sees this"),
+            ScanOutcome::Found { value, .. } => {
+                assert_eq!(value.as_slice(), b"attacker sees this")
+            }
             ScanOutcome::NotFound { .. } => panic!("attacker record must be readable"),
         }
 
@@ -584,8 +610,54 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let err = launch(&missing, &[], |_p| Ok(Vec::new())).expect_err("missing store must fail");
+        let err = launch(&missing, &[], Limits::default(), |_p| Ok(Vec::new()))
+            .expect_err("missing store must fail");
         assert!(matches!(err, AgentLaunchError::Core(Error::StoreNotFound)));
+    }
+
+    #[test]
+    fn launch_open_policy_rejects_above_limit_header_before_any_prompt() {
+        use wsecret_core::store::OPS_LIMIT_MAX;
+        let path = std::env::temp_dir().join(format!(
+            "wsecret-agent-above-limit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        // Header above the ordinary `OPS_LIMIT_MAX` ceiling: written raw —
+        // neither writing nor opening runs any KDF.
+        std::fs::write(&path, Header::encode_init([0x2a; 32], OPS_LIMIT_MAX + 1)).unwrap();
+
+        // Default policy: rejected before the passphrase prompt (the open
+        // gate runs first), so nothing is typed and no derivation happens.
+        let mut prompts: Vec<String> = Vec::new();
+        let err = launch(&path, &[], Limits::default(), |p| {
+            prompts.push(p.to_owned());
+            Ok(Vec::new())
+        })
+        .expect_err("the ordinary policy must reject the above-limit header");
+        let diagnosis = match err {
+            AgentLaunchError::Core(Error::ResourceLimit(diagnosis)) => diagnosis,
+            other => panic!("want Core(ResourceLimit), got {other:?}"),
+        };
+        assert_eq!(diagnosis.actual, OPS_LIMIT_MAX + 1);
+        assert_eq!(diagnosis.limit, OPS_LIMIT_MAX);
+        assert!(
+            prompts.is_empty(),
+            "no prompt may happen on an above-limit header: {prompts:?}"
+        );
+
+        // The explicit override reaches the prompt; the empty entry is the
+        // upstream cancel case — the launch ends before any KDF or spawn.
+        let mut prompts: Vec<String> = Vec::new();
+        let err = launch(&path, &[], Limits::allow_expensive_kdf(), |p| {
+            prompts.push(p.to_owned());
+            Ok(Vec::new())
+        })
+        .expect_err("empty passphrase is the upstream cancel case");
+        assert!(matches!(err, AgentLaunchError::Cancelled));
+        assert_eq!(prompts, vec![PROMPT_PASSPHRASE.to_owned()]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

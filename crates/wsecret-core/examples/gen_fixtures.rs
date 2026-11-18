@@ -56,7 +56,6 @@ impl Partition {
             Partition::B => "P_B",
         }
     }
-
 }
 
 /// One fixture record: fixed name, fixed value, fixed partition. The vector
@@ -148,10 +147,10 @@ fn generate(path: &Path, recs: &[Record]) -> Result<(), String> {
         Store::create(path, OPS_LIMIT).map_err(|e| format!("create {}: {e:?}", path.display()))?;
     // `Session::unlock` erases its passphrase buffer, so each partition gets
     // a fresh copy.
-    let sess_a = Session::unlock(&header, &mut PASS_A.to_vec())
-        .map_err(|e| format!("unlock P_A: {e:?}"))?;
-    let sess_b = Session::unlock(&header, &mut PASS_B.to_vec())
-        .map_err(|e| format!("unlock P_B: {e:?}"))?;
+    let sess_a =
+        Session::unlock(&header, &mut PASS_A.to_vec()).map_err(|e| format!("unlock P_A: {e:?}"))?;
+    let sess_b =
+        Session::unlock(&header, &mut PASS_B.to_vec()).map_err(|e| format!("unlock P_B: {e:?}"))?;
     for (i, rec) in recs.iter().enumerate() {
         let sess = match rec.partition {
             Partition::A => &sess_a,
@@ -199,10 +198,10 @@ fn verify(path: &Path, recs: &[Record]) -> Result<Vec<String>, String> {
         header.ops_limit
     ));
 
-    let sess_a = Session::unlock(&header, &mut PASS_A.to_vec())
-        .map_err(|e| format!("unlock P_A: {e:?}"))?;
-    let sess_b = Session::unlock(&header, &mut PASS_B.to_vec())
-        .map_err(|e| format!("unlock P_B: {e:?}"))?;
+    let sess_a =
+        Session::unlock(&header, &mut PASS_A.to_vec()).map_err(|e| format!("unlock P_A: {e:?}"))?;
+    let sess_b =
+        Session::unlock(&header, &mut PASS_B.to_vec()).map_err(|e| format!("unlock P_B: {e:?}"))?;
 
     for part in [Partition::A, Partition::B] {
         let sess = match part {
@@ -261,7 +260,7 @@ fn verify(path: &Path, recs: &[Record]) -> Result<Vec<String>, String> {
                         String::from_utf8_lossy(rec.name)
                     ));
                 }
-                if name != rec.name || value != rec.value {
+                if name != rec.name || value.as_slice() != rec.value {
                     return Err(format!(
                         "{}: {:?} decoded bytes differ from the fixture spec",
                         path.display(),
@@ -284,7 +283,9 @@ fn verify(path: &Path, recs: &[Record]) -> Result<Vec<String>, String> {
             Partition::B => &sess_a,
         };
         if !matches!(
-            store.find(other, rec.name, false).map_err(|e| format!("find cross: {e:?}"))?,
+            store
+                .find(other, rec.name, false)
+                .map_err(|e| format!("find cross: {e:?}"))?,
             ScanOutcome::NotFound { .. }
         ) {
             return Err(format!(
@@ -366,11 +367,8 @@ fn upstream_commands() -> Vec<&'static str> {
 fn manifest(recs: &[Record], files: &[(String, Vec<u8>)]) -> String {
     let mut m = String::with_capacity(16 * 1024);
     writeln!(m, "{{").expect("writing to a String cannot fail");
-    writeln!(
-        m,
-        "  \"schema\": \"wsecret.fixtures.stores/1\",",
-    )
-    .expect("writing to a String cannot fail");
+    writeln!(m, "  \"schema\": \"wsecret.fixtures.stores/1\",",)
+        .expect("writing to a String cannot fail");
     writeln!(
         m,
         "  \"generator\": {{ \"path\": \"crates/wsecret-core/examples/gen_fixtures.rs\", \
@@ -398,8 +396,7 @@ fn manifest(recs: &[Record], files: &[(String, Vec<u8>)]) -> String {
          \"libhydrogen_commit\": \"6c58976b3b9178441218c12bca2cc414d9efe30d\", \
          \"argz_commit\": \"9aeb9e035c80236dfc86c2b3bd124044419d9531\", \
          \"format_version\": {}, \"block_bytes\": {} }},",
-        VERSION.0,
-        BLOCK
+        VERSION.0, BLOCK
     )
     .expect("writing to a String cannot fail");
     writeln!(
@@ -492,11 +489,7 @@ fn manifest(recs: &[Record], files: &[(String, Vec<u8>)]) -> String {
     writeln!(m, "    \"build\": {},", jesc(BUILD_COMMAND))
         .expect("writing to a String cannot fail");
     for (idx, (key, target, fixture)) in [
-        (
-            "linux_origin",
-            "Linux x64",
-            "linux-origin.secret",
-        ),
+        ("linux_origin", "Linux x64", "linux-origin.secret"),
         ("mac_origin", "macOS", "mac-origin.secret"),
     ]
     .into_iter()
@@ -512,12 +505,8 @@ fn manifest(recs: &[Record], files: &[(String, Vec<u8>)]) -> String {
             writeln!(m, "        {}{}", jesc(&cmd), comma)
                 .expect("writing to a String cannot fail");
         }
-        writeln!(
-            m,
-            "      ]\n    }}{}",
-            if idx == 0 { "," } else { "" }
-        )
-        .expect("writing to a String cannot fail");
+        writeln!(m, "      ]\n    }}{}", if idx == 0 { "," } else { "" })
+            .expect("writing to a String cannot fail");
     }
     writeln!(m, "  }},").expect("writing to a String cannot fail");
 

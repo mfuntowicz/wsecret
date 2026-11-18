@@ -19,9 +19,15 @@
 //! 4. A ciphertext block failing authentication: skipped and preserved as an
 //!    opaque block, never deleted; `show K` → `Fatal: Secret K not found`.
 //! 5. A duplicated record: first match wins; `list` prints the name twice.
-//! 6. ops_limit = 2^64-1: upstream hangs in the KDF; the opt-in
-//!    `Limits::max_opslimit` cap rejects with `Error::ResourceLimit`
-//!    (RESOURCE_LIMIT = 8) BEFORE any KDF execution (timed).
+//! 6. ops_limit = 2^64-1 (WS-06): upstream hangs in the KDF; the DEFAULT
+//!    open policy (max opslimit 1000000) rejects with `Error::ResourceLimit`
+//!    (RESOURCE_LIMIT = 8) BEFORE any KDF execution or prompt (timed). The
+//!    explicit `--allow-expensive-kdf` in the global leading position (or
+//!    `Limits::allow_expensive_kdf()`) is the only override, is never
+//!    inherited from the environment or `agent` child args, and does not
+//!    lift the 10000 floor. `init` is bounded consistently and the cap
+//!    rejection names the limit exceeded, the numerical bound and the
+//!    explicit remedy.
 //! 7. Name byte-class matrix: accept `a`, `a/b`, `héllo`, `~!@#$%^&*()`,
 //!    255×`x`; reject `""`, `"a b"`, `"a\tb"`, `"a\nb"` with the exact
 //!    upstream name-rule strings.
@@ -43,16 +49,14 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use harness::{
-    run_wsecret, run_wsecret_lines, temp_store, ChildStdout, ConsoleSession, PASS_A,
-};
+use harness::{ChildStdout, ConsoleSession, PASS_A, run_wsecret, run_wsecret_lines, temp_store};
 use wsecret_core::error::Status;
 use wsecret_core::format::{
-    build_entry_payload, Header, BLOCK, ENTRY_DATA_LEN, ENTRY_PLAIN_LEN, NAME_MAX,
-    OPS_LIMIT_DEFAULT, OPS_LIMIT_MIN, VALUE_MAX,
+    BLOCK, ENTRY_DATA_LEN, ENTRY_PLAIN_LEN, Header, NAME_MAX, OPS_LIMIT_DEFAULT, OPS_LIMIT_MIN,
+    VALUE_MAX, build_entry_payload,
 };
 use wsecret_core::session::Session;
-use wsecret_core::store::{Limits, Store};
+use wsecret_core::store::{Limits, OPS_LIMIT_MAX, Store};
 use wsecret_core::{CommitState, Error, FormatError};
 
 /// The fixture passphrase (same bytes as [`PASS_A`]).
@@ -200,9 +204,20 @@ fn header_version_1_fatals_unkown_version() {
     let session = ConsoleSession::new();
     let out = temp_store("hdr-version-out");
     // The header fatal happens before any prompt: nothing is typed.
-    let run = run_wsecret_lines(&session, &store, &["list"], &[], None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret_lines(
+        &session,
+        &store,
+        &["list"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "version-1 fatal line", b"Fatal: Unkown version 1\n");
-    assert!(run.stdout.is_empty(), "no stdout on a header fatal; got {:x?}", run.stdout);
+    assert!(
+        run.stdout.is_empty(),
+        "no stdout on a header fatal; got {:x?}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -212,13 +227,24 @@ fn header_ops_limit_below_floor_fatals_minimum() {
 
     let session = ConsoleSession::new();
     let out = temp_store("hdr-ops-out");
-    let run = run_wsecret_lines(&session, &store, &["list"], &[], None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret_lines(
+        &session,
+        &store,
+        &["list"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(
         &run,
         "opslimit-below-floor fatal line",
         b"Fatal: Store opslimit is below the minimum of 10000\n",
     );
-    assert!(run.stdout.is_empty(), "no stdout on a header fatal; got {:x?}", run.stdout);
+    assert!(
+        run.stdout.is_empty(),
+        "no stdout on a header fatal; got {:x?}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -228,9 +254,24 @@ fn store_shorter_than_one_block_fatals_unable_to_read() {
         let store = temp_store(&format!("hdr-short-{tag}"));
         fs::write(&store, &bytes).unwrap();
         let out = temp_store(&format!("hdr-short-out-{tag}"));
-        let run = run_wsecret_lines(&session, &store, &["list"], &[], None, ChildStdout::CaptureFile(&out));
-        assert_fatal(&run, &format!("{tag} store fatal line"), &unable_to_read(&store));
-        assert!(run.stdout.is_empty(), "{tag}: no stdout; got {:x?}", run.stdout);
+        let run = run_wsecret_lines(
+            &session,
+            &store,
+            &["list"],
+            &[],
+            None,
+            ChildStdout::CaptureFile(&out),
+        );
+        assert_fatal(
+            &run,
+            &format!("{tag} store fatal line"),
+            &unable_to_read(&store),
+        );
+        assert!(
+            run.stdout.is_empty(),
+            "{tag}: no stdout; got {:x?}",
+            run.stdout
+        );
     }
 }
 
@@ -241,19 +282,45 @@ fn store_exactly_one_block_at_floor_opslimit_accepted_zero_records() {
 
     let session = ConsoleSession::new();
     let out = temp_store("hdr-ok-out");
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_eq!(
         run.code,
         0,
         "512-byte store at ops_limit 10000 must be accepted; stderr verbatim: {:?}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert!(run.stdout.is_empty(), "zero records: empty listing; got {:x?}", run.stdout);
-    assert!(run.stderr.is_empty(), "no fatal on an accepted store; got {:x?}", run.stderr);
+    assert!(
+        run.stdout.is_empty(),
+        "zero records: empty listing; got {:x?}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "no fatal on an accepted store; got {:x?}",
+        run.stderr
+    );
 
     // Zero records also means every lookup is upstream's not-found fatal.
-    let run = run_wsecret(&session, &store, &["show", "x"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_fatal(&run, "lookup on the empty store", b"Fatal: Secret x not found\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "x"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "lookup on the empty store",
+        b"Fatal: Secret x not found\n",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -266,19 +333,50 @@ fn trailing_300_byte_fragment_ignored_on_read() {
     let key = session_key(PASS_A);
     write_store(
         &store,
-        &[record_block(&key, b"alpha", b"one"), record_block(&key, b"beta", b"two")],
+        &[
+            record_block(&key, b"alpha", b"one"),
+            record_block(&key, b"beta", b"two"),
+        ],
         &[0xee; 300],
     );
 
     let session = ConsoleSession::new();
     let out = temp_store("tail-300-out");
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("list ignores the fragment", &run.stdout, b"alpha\nbeta\n");
 
-    let run = run_wsecret(&session, &store, &["show", "beta"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
-    assert_bytes("records stay readable past the fragment", &run.stdout, b"two");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "beta"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_bytes(
+        "records stay readable past the fragment",
+        &run.stdout,
+        b"two",
+    );
 }
 
 #[test]
@@ -290,8 +388,20 @@ fn store_513_bytes_tolerated_on_read_rejected_on_mutation() {
     let out = temp_store("tail-513-out");
 
     // Read tolerance: an empty listing, exit 0 (upstream-exact).
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert!(run.stdout.is_empty(), "zero records; got {:x?}", run.stdout);
 
     // Mutation rejection through the full CLI flow. The store is an empty
@@ -306,8 +416,16 @@ fn store_513_bytes_tolerated_on_read_rejected_on_mutation() {
         Some(b"v"),
         ChildStdout::CaptureFile(&out),
     );
-    assert_fatal(&run, "513-byte mutation fatal line", &unable_to_read(&store));
-    assert_bytes("store unchanged after the rejected mutation", &fs::read(&store).unwrap(), &before);
+    assert_fatal(
+        &run,
+        "513-byte mutation fatal line",
+        &unable_to_read(&store),
+    );
+    assert_bytes(
+        "store unchanged after the rejected mutation",
+        &fs::read(&store).unwrap(),
+        &before,
+    );
 
     // Library level: `MALFORMED_STORE` (status 7), pre-write.
     let (mut st, _) = Store::open(&store).unwrap();
@@ -337,20 +455,50 @@ fn store_1025_bytes_tolerated_on_read_rejected_on_mutation() {
     let session = ConsoleSession::new();
     let out = temp_store("tail-1025-out");
 
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("list over the 1025-byte store", &run.stdout, b"alpha\n");
 
     let before = fs::read(&store).unwrap();
-    let run = run_wsecret(&session, &store, &["update", "alpha"], PASS_STR, Some(b"x"), ChildStdout::CaptureFile(&out));
-    assert_fatal(&run, "1025-byte mutation fatal line", &unable_to_read(&store));
-    assert_bytes("store unchanged after the rejected mutation", &fs::read(&store).unwrap(), &before);
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["update", "alpha"],
+        PASS_STR,
+        Some(b"x"),
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "1025-byte mutation fatal line",
+        &unable_to_read(&store),
+    );
+    assert_bytes(
+        "store unchanged after the rejected mutation",
+        &fs::read(&store).unwrap(),
+        &before,
+    );
 
     // Library level: same rejection on the append path.
     let (mut st, _) = Store::open(&store).unwrap();
     let s = Session::unlock(st.header(), &mut PASS_A.to_vec()).unwrap();
     let failure = st.append_or_reuse(None, &s, b"new", b"v").unwrap_err();
-    assert!(matches!(failure.error, Error::Format(FormatError::StoreLayout)));
+    assert!(matches!(
+        failure.error,
+        Error::Format(FormatError::StoreLayout)
+    ));
     assert_eq!(failure.error.status(), Status::MalformedStore);
     assert_eq!(failure.state, CommitState::NotCommitted);
 }
@@ -379,22 +527,60 @@ fn unbounded_name_record_rejects_bounded() {
 
     // `list` rejects BOUNDED: fatal, no stdout at all (not even earlier
     // valid names — no partial name of the poison record can leak).
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "bounded list rejection", b"Fatal: Invalid secret\n");
-    assert!(run.stdout.is_empty(), "no partial name may leak; got {:x?}", run.stdout);
+    assert!(
+        run.stdout.is_empty(),
+        "no partial name may leak; got {:x?}",
+        run.stdout
+    );
 
     // `show` scans PAST the record without overreading it (upstream-exact:
     // the raw match compare fails — the name is not NUL-bounded at the query
     // length — so the record is never decoded).
-    let run = run_wsecret(&session, &store, &["show", "poison"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_fatal(&run, "scan-past not-found", b"Fatal: Secret poison not found\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "poison"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "scan-past not-found",
+        b"Fatal: Secret poison not found\n",
+    );
 
     // Records on both sides stay readable: no overread, no corruption.
-    let run = run_wsecret(&session, &store, &["show", "beta"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "beta"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("record after the poison block", &run.stdout, b"two");
 
-    assert_bytes("store unchanged after every rejection", &fs::read(&store).unwrap(), &before);
+    assert_bytes(
+        "store unchanged after every rejection",
+        &fs::read(&store).unwrap(),
+        &before,
+    );
 }
 
 #[test]
@@ -417,25 +603,70 @@ fn oversized_slen_record_rejects_bounded() {
 
     // Exact match → bounded `Invalid secret` (upstream `s_get_secret`'s
     // exact-match arm fatals the same string for an out-of-bounds slen).
-    let run = run_wsecret(&session, &store, &["show", "poison"], PASS_STR, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "poison"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "bounded show rejection", b"Fatal: Invalid secret\n");
-    assert!(run.stdout.is_empty(), "no partial value may leak; got {:x?}", run.stdout);
+    assert!(
+        run.stdout.is_empty(),
+        "no partial value may leak; got {:x?}",
+        run.stdout
+    );
 
     // A mutation targeting the record is rejected WITHOUT any write.
-    let run = run_wsecret(&session, &store, &["update", "poison"], PASS_STR, Some(b"x"), ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["update", "poison"],
+        PASS_STR,
+        Some(b"x"),
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "bounded update rejection", b"Fatal: Invalid secret\n");
 
     // `list` rejects bounded too (nothing printed).
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "bounded list rejection", b"Fatal: Invalid secret\n");
-    assert!(run.stdout.is_empty(), "no partial name may leak; got {:x?}", run.stdout);
+    assert!(
+        run.stdout.is_empty(),
+        "no partial name may leak; got {:x?}",
+        run.stdout
+    );
 
     // Non-matching lookups scan past the record (upstream-exact).
-    let run = run_wsecret(&session, &store, &["show", "beta"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "beta"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("record after the poison block", &run.stdout, b"two");
 
-    assert_bytes("store unchanged after every rejection", &fs::read(&store).unwrap(), &before);
+    assert_bytes(
+        "store unchanged after every rejection",
+        &fs::read(&store).unwrap(),
+        &before,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -461,19 +692,62 @@ fn auth_failing_block_skipped_and_preserved_not_deleted() {
     let out = temp_store("auth-skip-out");
 
     // Skipped silently on read: it is not a record for this passphrase.
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
-    assert_bytes("list skips the auth-failing block", &run.stdout, b"keep\nother\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_bytes(
+        "list skips the auth-failing block",
+        &run.stdout,
+        b"keep\nother\n",
+    );
 
-    let run = run_wsecret(&session, &store, &["show", "K"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_fatal(&run, "opaque block is not a record", b"Fatal: Secret K not found\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "K"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "opaque block is not a record",
+        b"Fatal: Secret K not found\n",
+    );
 
     // Preserved byte-for-byte across a successful mutation — never deleted.
     let before = fs::read(&store).unwrap();
-    let run = run_wsecret(&session, &store, &["set", "fresh"], PASS_STR, Some(b"new"), ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["set", "fresh"],
+        PASS_STR,
+        Some(b"new"),
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     let after = fs::read(&store).unwrap();
-    assert_eq!(after.len(), before.len() + BLOCK, "exactly one appended record");
+    assert_eq!(
+        after.len(),
+        before.len() + BLOCK,
+        "exactly one appended record"
+    );
     assert_bytes(
         "auth-failing block preserved byte-for-byte",
         &after[BLOCK..2 * BLOCK],
@@ -481,9 +755,25 @@ fn auth_failing_block_skipped_and_preserved_not_deleted() {
     );
 
     // Still skipped after the append.
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
-    assert_bytes("list after the append", &run.stdout, b"keep\nother\nfresh\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_bytes(
+        "list after the append",
+        &run.stdout,
+        b"keep\nother\nfresh\n",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -496,58 +786,165 @@ fn duplicated_record_first_match_wins_list_prints_twice() {
     let key = session_key(PASS_A);
     write_store(
         &store,
-        &[record_block(&key, b"dup", b"first"), record_block(&key, b"dup", b"second")],
+        &[
+            record_block(&key, b"dup", b"first"),
+            record_block(&key, b"dup", b"second"),
+        ],
         &[],
     );
 
     let session = ConsoleSession::new();
     let out = temp_store("dup-out");
 
-    let run = run_wsecret(&session, &store, &["show", "dup"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "dup"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("first match wins", &run.stdout, b"first");
 
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
-    assert_bytes("list prints the duplicate twice", &run.stdout, b"dup\ndup\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_bytes(
+        "list prints the duplicate twice",
+        &run.stdout,
+        b"dup\ndup\n",
+    );
 
     // The update lands on the FIRST slot; the second block is untouched.
     let before = fs::read(&store).unwrap();
-    let run = run_wsecret(&session, &store, &["update", "dup"], PASS_STR, Some(b"changed"), ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["update", "dup"],
+        PASS_STR,
+        Some(b"changed"),
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     let after = fs::read(&store).unwrap();
-    assert_bytes("second duplicate block preserved", &after[2 * BLOCK..], &before[2 * BLOCK..]);
+    assert_bytes(
+        "second duplicate block preserved",
+        &after[2 * BLOCK..],
+        &before[2 * BLOCK..],
+    );
 
-    let run = run_wsecret(&session, &store, &["show", "dup"], PASS_STR, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", "dup"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_bytes("updated first slot", &run.stdout, b"changed");
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_bytes("list still prints the name twice", &run.stdout, b"dup\ndup\n");
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_bytes(
+        "list still prints the name twice",
+        &run.stdout,
+        b"dup\ndup\n",
+    );
 }
 
 // ---------------------------------------------------------------------------
-// 6. ops_limit = 2^64-1 — opt-in cap rejects before any KDF
+// 6. ops_limit above the ordinary ceiling — default cap pre-KDF/prompt, with
+//    the explicit, position-restricted override (WS-06)
 // ---------------------------------------------------------------------------
 
+/// The WS-06 cap-rejection line: limit exceeded, the numerical bound and the
+/// explicit remedy (asserted verbatim).
+fn cap_line(actual: u64, limit: u64) -> Vec<u8> {
+    fatal(
+        format!(
+            "Store opslimit {actual} exceeds the limit of {limit}; re-run with --allow-expensive-kdf before the command to allow expensive key derivation"
+        )
+        .as_bytes(),
+    )
+}
+
 #[test]
-fn ops_limit_2_pow_64_1_rejected_by_the_opt_in_cap_before_any_kdf() {
+fn ops_limit_2_pow_64_1_rejected_pre_kdf_by_the_default_cap_with_explicit_override() {
     let store = temp_store("ops-max");
     fs::write(&store, Header::encode_init(MASTER, u64::MAX)).unwrap();
 
     // Upstream-equivalent acceptance: `s_header` only enforces the 10000
-    // floor, so the header parses and the store opens. The unbounded CPU
-    // cost lives in the KDF (`Session::unlock`) — upstream runs it to
-    // completion at 2^64-1 ops (pins a core ~forever). The unlock is
-    // deliberately NEVER called in this test.
+    // floor, so the header parses. The unbounded CPU cost lives in the KDF
+    // (`Session::unlock`) — upstream runs it to completion at 2^64-1 ops
+    // (pins a core ~forever). The unlock is deliberately NEVER called here.
     let block = Header::encode_init(MASTER, u64::MAX);
     let parsed = Header::parse(&block).expect("upstream accepts any ops_limit >= 10000");
     assert_eq!(parsed.ops_limit, u64::MAX);
-    let (_store, header) = Store::open(&store).expect("no cap: opens like upstream");
-    assert_eq!(header.ops_limit, u64::MAX);
 
-    // With the opt-in cap (plan §3.4 limits policy, §9 blocker 9) the open
-    // itself rejects BEFORE any KDF execution or store-sized allocation:
-    // `Error::ResourceLimit` (RESOURCE_LIMIT = status 8), within a bounded
-    // time that proves no derivation ran.
+    // WS-06: the DEFAULT policy caps `ops_limit` at OPS_LIMIT_MAX (1000000),
+    // so an ordinary open rejects BEFORE any KDF execution or store-sized
+    // allocation — `Error::ResourceLimit` (RESOURCE_LIMIT = status 8) with
+    // the full diagnosis, within a bounded time that proves no derivation
+    // ran.
+    let started = Instant::now();
+    let err = match Store::open(&store) {
+        Err(err) => err,
+        Ok(_) => panic!("the default cap must reject ops_limit = 2^64-1 pre-KDF"),
+    };
+    let elapsed = started.elapsed();
+    assert_eq!(err.status(), Status::ResourceLimit);
+    assert_eq!(Status::ResourceLimit.code(), 8);
+    let diagnosis = match err {
+        Error::ResourceLimit(diagnosis) => diagnosis,
+        other => panic!("want ResourceLimit, got {other:?}"),
+    };
+    assert_eq!(diagnosis.actual, u64::MAX);
+    assert_eq!(diagnosis.limit, OPS_LIMIT_MAX);
+    assert_eq!(
+        diagnosis.remedy,
+        wsecret_core::error::LimitRemedy::AllowExpensiveKdf
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the cap check must run pre-KDF; took {elapsed:?}"
+    );
+
+    // The explicit override is the documented way to open upstream-legal
+    // expensive stores. Acceptance happens at OPEN time, which never runs
+    // the KDF — proven here without expensive computation.
+    let (handle, header) = Store::open_with_limits(&store, Limits::allow_expensive_kdf())
+        .expect("the explicit override opens like upstream");
+    assert_eq!(header.ops_limit, u64::MAX);
+    drop(handle);
+
+    // A caller-configured cap rejects the same way (diagnosis + status 8).
     let started = Instant::now();
     let result = Store::open_with_limits(
         &store,
@@ -559,17 +956,203 @@ fn ops_limit_2_pow_64_1_rejected_by_the_opt_in_cap_before_any_kdf() {
     let elapsed = started.elapsed();
     let err = match result {
         Err(err) => err,
-        Ok(_) => panic!(
-            "the opt-in cap must reject ops_limit = 2^64-1 (the KDF would pin a core ~forever)"
-        ),
+        Ok(_) => panic!("the explicit cap must reject ops_limit = 2^64-1"),
     };
-    assert!(matches!(err, Error::ResourceLimit), "want ResourceLimit, got {err:?}");
+    assert!(
+        matches!(err, Error::ResourceLimit(_)),
+        "want ResourceLimit, got {err:?}"
+    );
     assert_eq!(err.status(), Status::ResourceLimit);
     assert_eq!(Status::ResourceLimit.code(), 8);
     assert!(
         elapsed < Duration::from_secs(5),
         "the cap check must run pre-KDF; took {elapsed:?}"
     );
+}
+
+#[test]
+fn above_limit_header_fatals_with_bound_and_remedy_before_any_prompt() {
+    let store = temp_store("cap-cli");
+    fs::write(&store, Header::encode_init(MASTER, OPS_LIMIT_MAX + 1)).unwrap();
+
+    // EMPTY input lines: a prompt would stall the harness to its 60 s
+    // timeout — completing here proves the fatal happens before the prompt,
+    // and the fatal names the limit exceeded, the numerical bound and the
+    // explicit remedy.
+    let session = ConsoleSession::new();
+    let out = temp_store("cap-cli-out");
+    let run = run_wsecret_lines(
+        &session,
+        &store,
+        &["list"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "above-limit cap fatal",
+        &cap_line(OPS_LIMIT_MAX + 1, OPS_LIMIT_MAX),
+    );
+    assert!(
+        run.stdout.is_empty(),
+        "no stdout on a cap fatal; got {:x?}",
+        run.stdout
+    );
+
+    // The trailing position is NOT honored (global-leading-only rule): the
+    // word is an ordinary operand and the same fatal stands.
+    let run = run_wsecret_lines(
+        &session,
+        &store,
+        &["list", "--allow-expensive-kdf"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "trailing flag is not the override",
+        &cap_line(OPS_LIMIT_MAX + 1, OPS_LIMIT_MAX),
+    );
+}
+
+#[test]
+fn allow_expensive_kdf_before_the_command_lifts_the_cap_without_kdf() {
+    let store = temp_store("cap-override");
+    fs::write(&store, Header::encode_init(MASTER, OPS_LIMIT_MAX + 1)).unwrap();
+
+    // The override is honored in the global leading position: the run gets
+    // past the cap to the passphrase prompt. An EMPTY typed line is
+    // upstream's `s_exit(0)` — exit 0 before any KDF — so the acceptance is
+    // demonstrated without expensive computation (timed).
+    let session = ConsoleSession::new();
+    let out = temp_store("cap-override-out");
+    let started = Instant::now();
+    let run = run_wsecret_lines(
+        &session,
+        &store,
+        &["--allow-expensive-kdf", "list"],
+        &[""],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(
+        run.code,
+        0,
+        "empty input must exit 0; stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stdout.is_empty(), "got {:x?}", run.stdout);
+    assert!(run.stderr.is_empty(), "got {:x?}", run.stderr);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "no KDF may run on empty input; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn init_is_bounded_consistently_and_the_override_is_explicit() {
+    let session = ConsoleSession::new();
+    let out = temp_store("cap-init-out");
+
+    // Above the cap: the fatal names the limit exceeded, the numerical
+    // bound and the explicit remedy; no store is created.
+    let over = temp_store("cap-init-over");
+    let run = run_wsecret_lines(
+        &session,
+        &over,
+        &["init", "opslimit", "1000001"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "init above the cap",
+        &cap_line(OPS_LIMIT_MAX + 1, OPS_LIMIT_MAX),
+    );
+    assert!(!over.exists(), "no store may be created above the cap");
+
+    // The ceiling itself is the accepted boundary.
+    let at = temp_store("cap-init-at");
+    let run = run_wsecret_lines(
+        &session,
+        &at,
+        &["init", "opslimit", "1000000"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "boundary init; stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let (handle, header) = Store::open(&at).expect("ordinary open accepts the boundary");
+    assert_eq!(header.ops_limit, OPS_LIMIT_MAX);
+    drop(handle);
+
+    // The explicit override creates the expensive store (creation derives
+    // nothing, so this is cheap) and the header carries the value verbatim;
+    // ordinary opens then require the same explicit override.
+    let expensive = temp_store("cap-init-override");
+    let run = run_wsecret_lines(
+        &session,
+        &expensive,
+        &["--allow-expensive-kdf", "init", "opslimit", "2000000"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "override init; stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let (handle, header) = Store::open_with_limits(&expensive, Limits::allow_expensive_kdf())
+        .expect("the override opens the expensive store");
+    assert_eq!(header.ops_limit, 2_000_000);
+    drop(handle);
+    let run = run_wsecret_lines(
+        &session,
+        &expensive,
+        &["list"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "the expensive store needs the override again",
+        &cap_line(2_000_000, OPS_LIMIT_MAX),
+    );
+
+    // "normal minimum still applies": the override never lifts the 10000
+    // floor — option parsing rejects the below-floor value (exit 255).
+    let floor = temp_store("cap-init-floor");
+    let run = run_wsecret_lines(
+        &session,
+        &floor,
+        &["--allow-expensive-kdf", "init", "opslimit", "9999"],
+        &[],
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        255,
+        "below-floor opslimit must stay rejected; stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stderr,
+        b"Option opslimit must be a number greater than or equal to 10000\n"
+    );
+    assert!(!floor.exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -606,8 +1189,20 @@ fn name_byte_class_matrix_accepts() {
 
     // Every accepted name round-trips byte-exact.
     for name in names {
-        let run = run_wsecret(&session, &store, &["show", name], PASS_STR, None, ChildStdout::CaptureFile(&out));
-        assert_eq!(run.code, 0, "show {name:?}; stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+        let run = run_wsecret(
+            &session,
+            &store,
+            &["show", name],
+            PASS_STR,
+            None,
+            ChildStdout::CaptureFile(&out),
+        );
+        assert_eq!(
+            run.code,
+            0,
+            "show {name:?}; stderr verbatim: {:?}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         assert_bytes(&format!("show {name:?}"), &run.stdout, b"v");
     }
 
@@ -617,8 +1212,20 @@ fn name_byte_class_matrix_accepts() {
         want.extend_from_slice(name.as_bytes());
         want.push(b'\n');
     }
-    let run = run_wsecret(&session, &store, &["list"], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("list of the accepted byte classes", &run.stdout, &want);
 }
 
@@ -636,11 +1243,25 @@ fn name_byte_class_matrix_rejects() {
     let special = b"Fatal: Special characaters are not allowed in keys\n";
 
     // Empty name (raw empty operand).
-    let run = run_wsecret(&session, &store, &["set", ""], PASS_STR, Some(b"v"), ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["set", ""],
+        PASS_STR,
+        Some(b"v"),
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "empty name", empty);
 
     // Space in the name (raw operand).
-    let run = run_wsecret(&session, &store, &["set", "a b"], PASS_STR, Some(b"v"), ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["set", "a b"],
+        PASS_STR,
+        Some(b"v"),
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "space name", special);
 
     // Tab and newline: byte-exact delivery via `--keys-hex` (the rule under
@@ -659,7 +1280,11 @@ fn name_byte_class_matrix_rejects() {
     }
 
     // Bounded: no rejected name mutated the store.
-    assert_bytes("store unchanged after every rejected name", &fs::read(&store).unwrap(), &before);
+    assert_bytes(
+        "store unchanged after every rejected name",
+        &fs::read(&store).unwrap(),
+        &before,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -677,18 +1302,57 @@ fn name_length_boundary_255_accepted_256_rejected() {
 
     // Exactly 255 bytes: accepted and round-trips.
     let name255 = "x".repeat(NAME_MAX);
-    let run = run_wsecret(&session, &store, &["set", &name255], PASS_STR, Some(b"v"), ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "255-byte name must be accepted; stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
-    let run = run_wsecret(&session, &store, &["show", &name255], PASS_STR, None, ChildStdout::CaptureFile(&out));
-    assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["set", &name255],
+        PASS_STR,
+        Some(b"v"),
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "255-byte name must be accepted; stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["show", &name255],
+        PASS_STR,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_eq!(
+        run.code,
+        0,
+        "stderr verbatim: {:?}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_bytes("255-byte name round-trips", &run.stdout, b"v");
 
     // 256 bytes: rejected with the exact upstream limit message.
     let before = fs::read(&store).unwrap();
     let name256 = "x".repeat(NAME_MAX + 1);
-    let run = run_wsecret(&session, &store, &["set", &name256], PASS_STR, Some(b"v"), ChildStdout::CaptureFile(&out));
-    assert_fatal(&run, "256-byte name", b"Fatal: Keys are limited to 255 bytes\n");
-    assert_bytes("store unchanged after the rejected name", &fs::read(&store).unwrap(), &before);
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["set", &name256],
+        PASS_STR,
+        Some(b"v"),
+        ChildStdout::CaptureFile(&out),
+    );
+    assert_fatal(
+        &run,
+        "256-byte name",
+        b"Fatal: Keys are limited to 255 bytes\n",
+    );
+    assert_bytes(
+        "store unchanged after the rejected name",
+        &fs::read(&store).unwrap(),
+        &before,
+    );
 }
 
 #[test]
@@ -704,23 +1368,61 @@ fn value_length_boundary_473_minus_name_len() {
     for name in ["k", "abcd"] {
         let max = VALUE_MAX - name.len();
         let value = vec![0x41u8; max];
-        let run = run_wsecret(&session, &store, &["set", name], PASS_STR, Some(value.as_slice()), ChildStdout::CaptureFile(&out));
+        let run = run_wsecret(
+            &session,
+            &store,
+            &["set", name],
+            PASS_STR,
+            Some(value.as_slice()),
+            ChildStdout::CaptureFile(&out),
+        );
         assert_eq!(
             run.code,
             0,
             "set {name} with {max} bytes (473 − len) must be accepted; stderr verbatim: {:?}",
             String::from_utf8_lossy(&run.stderr)
         );
-        let run = run_wsecret(&session, &store, &["dump", name], PASS_STR, None, ChildStdout::CaptureFile(&out));
-        assert_eq!(run.code, 0, "stderr verbatim: {:?}", String::from_utf8_lossy(&run.stderr));
-        assert_bytes(&format!("dump {name} at the size bound"), &run.stdout, &value);
+        let run = run_wsecret(
+            &session,
+            &store,
+            &["dump", name],
+            PASS_STR,
+            None,
+            ChildStdout::CaptureFile(&out),
+        );
+        assert_eq!(
+            run.code,
+            0,
+            "stderr verbatim: {:?}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_bytes(
+            &format!("dump {name} at the size bound"),
+            &run.stdout,
+            &value,
+        );
 
         // One more byte: `Entry too big!`, and the rejection writes nothing.
         let before = fs::read(&store).unwrap();
         let over = vec![0x42u8; max + 1];
-        let run = run_wsecret(&session, &store, &["update", name], PASS_STR, Some(over.as_slice()), ChildStdout::CaptureFile(&out));
-        assert_fatal(&run, &format!("one-over value for {name}"), b"Fatal: Entry too big!\n");
-        assert_bytes("store unchanged after the rejected value", &fs::read(&store).unwrap(), &before);
+        let run = run_wsecret(
+            &session,
+            &store,
+            &["update", name],
+            PASS_STR,
+            Some(over.as_slice()),
+            ChildStdout::CaptureFile(&out),
+        );
+        assert_fatal(
+            &run,
+            &format!("one-over value for {name}"),
+            b"Fatal: Entry too big!\n",
+        );
+        assert_bytes(
+            "store unchanged after the rejected value",
+            &fs::read(&store).unwrap(),
+            &before,
+        );
     }
 }
 
@@ -733,7 +1435,8 @@ fn passphrase_length_boundary_127_accepted_128_input_too_long() {
     let pass127 = vec![b'p'; 127];
     let (mut st, header, _) = Store::create(&store, OPS_LIMIT_MIN).expect("create fixture");
     let s = Session::unlock(&header, &mut pass127.clone()).expect("unlock with 127 bytes");
-    st.append_or_reuse(None, &s, b"long", b"v").expect("append record");
+    st.append_or_reuse(None, &s, b"long", b"v")
+        .expect("append record");
     drop(s);
     drop(st);
 
@@ -741,16 +1444,34 @@ fn passphrase_length_boundary_127_accepted_128_input_too_long() {
     let out = temp_store("pass-len-out");
 
     let line127 = "p".repeat(127);
-    let run = run_wsecret(&session, &store, &["list"], &line127, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        &line127,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_eq!(
         run.code,
         0,
         "127-byte passphrase must be accepted; stderr verbatim: {:?}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_bytes("listing under the 127-byte passphrase", &run.stdout, b"long\n");
+    assert_bytes(
+        "listing under the 127-byte passphrase",
+        &run.stdout,
+        b"long\n",
+    );
 
     let line128 = "p".repeat(128);
-    let run = run_wsecret(&session, &store, &["list"], &line128, None, ChildStdout::CaptureFile(&out));
+    let run = run_wsecret(
+        &session,
+        &store,
+        &["list"],
+        &line128,
+        None,
+        ChildStdout::CaptureFile(&out),
+    );
     assert_fatal(&run, "128-byte passphrase", b"Fatal: Input too long!\n");
 }

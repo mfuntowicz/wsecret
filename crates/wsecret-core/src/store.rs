@@ -18,12 +18,15 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "fault-injection")]
 use crate::error::WARN_POST_COMMIT_CANCELLED;
-use crate::error::{Error, FormatError, NameError, WARN_ABANDONED_MUTEX, WARN_POST_COMMIT_PANIC};
+use crate::error::{
+    Error, FormatError, LimitExceeded, LimitKind, LimitRemedy, NameError, WARN_ABANDONED_MUTEX,
+    WARN_POST_COMMIT_PANIC,
+};
 use crate::format::{
     BLOCK, ENTRY_DATA_LEN, ENTRY_PLAIN_LEN, Entry, HEADER_LEN, Header, OPS_LIMIT_MIN,
     build_entry_payload, check_name,
 };
-use crate::session::Session;
+use crate::session::{SecretBytes, Session};
 use crate::windows::file as winfile;
 use crate::windows::security::{MutexOutcome, WriterMutex};
 
@@ -32,17 +35,23 @@ use crate::windows::security::{MutexOutcome, WriterMutex};
 pub use crate::error::{CommitFailure, CommitOutcome, CommitReceipt, CommitState};
 
 /// Result of [`Store::find`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Deliberately not `Clone`/`PartialEq`: the record value is secret
+/// material and must not be duplicated or compared through this handle.
+/// `Debug` is safe to log — [`SecretBytes`] renders `<redacted>`.
+#[derive(Debug)]
 pub enum ScanOutcome {
     /// First exact match (case-sensitive, full-length including the NUL
     /// terminator, upstream `hydro_equal(data, key, len + 1)`).
     Found {
         /// Byte offset of the record block (a multiple of 512, >= 512).
         slot: u64,
-        /// The record name.
+        /// The record name (metadata).
         name: Vec<u8>,
-        /// The record value.
-        value: Vec<u8>,
+        /// The record value: zeroizing owner, erased on drop (plan §5.3).
+        /// Borrow with [`SecretBytes::as_slice`]; the plaintext never
+        /// escapes as an ordinary `Vec`.
+        value: SecretBytes,
     },
     /// No match.
     NotFound {
@@ -55,24 +64,116 @@ pub enum ScanOutcome {
     },
 }
 
-/// Opt-in resource caps applied when opening a store (plan §3.4 limits
-/// policy; §9 blocker 9). `None` is unlimited — the DEFAULT, matching
-/// upstream acceptance of any `ops_limit >= 10000` (Hy4 P-3: a default bound
-/// would reject stores upstream accepts). `max_list_bytes` governs decrypted
-/// enumeration and is deliberately not part of this open-time gate.
+/// Result of [`Store::find_meta`]: metadata only — the record value never
+/// leaves the scan buffer, so existence probes and slot-only rewrites carry
+/// no secret bytes at all. `Debug` is safe to log (names are CLI-visible
+/// metadata; values are absent by construction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanMeta {
+    /// First exact match (same matching rules as [`ScanOutcome::Found`]).
+    Found {
+        /// Byte offset of the record block (a multiple of 512, >= 512).
+        slot: u64,
+        /// The record name (metadata).
+        name: Vec<u8>,
+    },
+    /// No match.
+    NotFound {
+        /// First decryptable `DELETED:`-prefixed record (tracked only when
+        /// `create` is true); the reusable slot.
+        tombstone: Option<u64>,
+        /// At least one record decrypted with this session key (upstream
+        /// `pass_ok` — feeds the confirmation gate).
+        decrypted_any: bool,
+    },
+}
+
+/// Internal result of [`Store::lookup`]: the caller's projection of a
+/// matched record, or the fixed not-found report.
+enum Lookup<T> {
+    Found(T),
+    NotFound {
+        tombstone: Option<u64>,
+        decrypted_any: bool,
+    },
+}
+
+/// Resource caps applied when opening a store (plan §3.4 limits policy; WS-06
+/// open policy). `None` for a field is "no ceiling" on that dimension.
 ///
-/// `max_opslimit` exists because the pinned KDF loop cannot be interrupted:
-/// a crafted header with `ops_limit = 2^64 - 1` pins a core ~forever
-/// (upstream hangs identically). The cap is checked after the header/size
-/// inspection but before any KDF execution or store-sized allocation — i.e.
-/// before the open returns its handle — so an opted-in caller can never
-/// reach the unbounded derivation (plan §3.4 enforcement order).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The DEFAULT policy ([`Limits::default`], used by [`Store::open`],
+/// [`Store::open_read`] and every ordinary CLI/agent/SSH/future-import open)
+/// caps the header `ops_limit` at [`OPS_LIMIT_MAX`] (1_000_000) and leaves
+/// the store size uncapped. This is a deliberate, documented divergence from
+/// upstream, which accepts any `ops_limit >= 10000`: the pinned KDF loop
+/// cannot be interrupted, so a crafted header with `ops_limit = 2^64 - 1`
+/// pins a core ~forever (upstream hangs identically). Stores created
+/// upstream with `ops_limit > 1_000_000` still open — through the explicit
+/// [`Limits::allow_expensive_kdf`] override (CLI: `--allow-expensive-kdf` in
+/// the leading position before the command word, never inherited from the
+/// environment or from `agent`/`ssh agent` child arguments). The
+/// [`OPS_LIMIT_MIN`] format floor always applies and is never lifted.
+///
+/// The cap is checked after the header/size inspection but before any KDF
+/// execution or store-sized allocation — i.e. before the open returns its
+/// handle — so no caller reaches an unbounded derivation or an expensive
+/// prompt by accident (plan §3.4 enforcement order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Maximum accepted header `ops_limit` (`None` = unlimited).
     pub max_opslimit: Option<u64>,
     /// Maximum accepted store size in bytes (`None` = unlimited).
     pub max_store_bytes: Option<u64>,
+}
+
+/// Ordinary-open ceiling for the header `ops_limit` (WS-06): the largest
+/// work factor an unmodified invocation derives without the explicit
+/// `--allow-expensive-kdf` override. Independent of the format constants —
+/// [`crate::format::OPS_LIMIT_MIN`] (10000) is the floor, upstream
+/// `init`'s default is 100000 — and enforced by [`Limits::default`].
+pub const OPS_LIMIT_MAX: u64 = 1_000_000;
+
+impl Limits {
+    /// The explicit expensive-KDF override (CLI `--allow-expensive-kdf`):
+    /// the `ops_limit` ceiling is lifted, every other cap keeps its ordinary
+    /// value. The [`OPS_LIMIT_MIN`] floor still applies. Never implicit —
+    /// callers must receive it from an explicit user action per invocation.
+    pub fn allow_expensive_kdf() -> Limits {
+        Limits {
+            max_opslimit: None,
+            ..Limits::default()
+        }
+    }
+
+    /// The `ops_limit` ceiling check shared by the open gate and the CLI
+    /// `init` bound. Enforces the [`Limits::max_opslimit`] ceiling only; the
+    /// [`OPS_LIMIT_MIN`] floor is a format invariant enforced at header
+    /// parse/create and is not lifted by any policy. A rejection carries the
+    /// full diagnosis (limit exceeded, numerical bound, explicit remedy).
+    pub fn check_opslimit(&self, ops_limit: u64) -> Result<(), Error> {
+        if let Some(limit) = self.max_opslimit {
+            if ops_limit > limit {
+                return Err(Error::ResourceLimit(LimitExceeded {
+                    kind: LimitKind::OpsLimit,
+                    actual: ops_limit,
+                    limit,
+                    remedy: LimitRemedy::AllowExpensiveKdf,
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for Limits {
+    /// The ordinary-open policy: [`OPS_LIMIT_MAX`] ceiling on `ops_limit`,
+    /// no store-size ceiling.
+    fn default() -> Self {
+        Limits {
+            max_opslimit: Some(OPS_LIMIT_MAX),
+            max_store_bytes: None,
+        }
+    }
 }
 
 /// An open store file (spec §3.5). Fields are private; the store is driven
@@ -316,6 +417,13 @@ impl Store {
     /// default 100000, minimum 10000 — pass
     /// [`crate::format::OPS_LIMIT_DEFAULT`] for the default).
     ///
+    /// Creation itself derives nothing (no KDF runs here) and enforces only
+    /// the [`OPS_LIMIT_MIN`] floor. Callers that want the ordinary open
+    /// policy (WS-06: `ops_limit` <= [`OPS_LIMIT_MAX`]) bound the value with
+    /// [`Limits::check_opslimit`] before creating — as the CLI `init` does —
+    /// otherwise the resulting store needs [`Limits::allow_expensive_kdf`]
+    /// to reopen.
+    ///
     /// A creation is a mutation (plan §5.6 point 4 "Initialization"): it
     /// reports [`CommitOutcome`] like every other write path.
     pub fn create(path: &Path, ops_limit: u64) -> CommitOutcome<(Store, Header, CommitReceipt)> {
@@ -388,21 +496,23 @@ impl Store {
 
     /// Opens an existing store read/write: reads the 512-byte header block
     /// and validates it as upstream `s_header` does (version 0, `ops_limit`
-    /// >= 10000). No resource caps (see [`Limits`]).
+    /// >= 10000). Ordinary policy ([`Limits::default`]): `ops_limit` capped
+    /// at [`OPS_LIMIT_MAX`] before any KDF or prompt (see [`Limits`]).
     pub fn open(path: &Path) -> Result<(Store, Header), Error> {
         Self::open_with_limits(path, Limits::default())
     }
 
     /// Opens an existing store read-only (read paths such as `list`/`show`
     /// work on stores the user cannot write, as upstream `O_RDONLY` does).
-    /// No resource caps (see [`Limits`]).
+    /// Ordinary policy ([`Limits::default`]): `ops_limit` capped at
+    /// [`OPS_LIMIT_MAX`] before any KDF or prompt (see [`Limits`]).
     pub fn open_read(path: &Path) -> Result<(Store, Header), Error> {
         Self::open_read_with_limits(path, Limits::default())
     }
 
     /// [`Store::open`] under `limits` (see [`Limits`]): the header/size
-    /// inspection plus the opt-in caps, all checked before any KDF execution
-    /// or store-sized allocation.
+    /// inspection plus the caps, all checked before any KDF execution or
+    /// store-sized allocation.
     pub fn open_with_limits(path: &Path, limits: Limits) -> Result<(Store, Header), Error> {
         let file = winfile::open_store(path).map_err(map_open_err)?;
         Self::open_file_with_limits(file, path, limits)
@@ -423,16 +533,16 @@ impl Store {
         // when a cap is also exceeded), then the caps — all before any KDF
         // execution or store-sized allocation (plan §3.4 enforcement order).
         let (header, block) = Self::read_header(&file)?;
-        if limits
-            .max_opslimit
-            .is_some_and(|max| header.ops_limit > max)
-        {
-            return Err(Error::ResourceLimit);
-        }
+        limits.check_opslimit(header.ops_limit)?;
         if let Some(max) = limits.max_store_bytes {
             let len = winfile::file_len(&file).map_err(io_err)?;
             if len > max {
-                return Err(Error::ResourceLimit);
+                return Err(Error::ResourceLimit(LimitExceeded {
+                    kind: LimitKind::StoreBytes,
+                    actual: len,
+                    limit: max,
+                    remedy: LimitRemedy::CallerConfigured,
+                }));
             }
         }
         let store = Self::bind(file, header.clone(), path, &block)?;
@@ -459,6 +569,10 @@ impl Store {
     /// [`Store::unlock_writers`] on the same thread when the section ends.
     /// Idempotent while already held. Mutations acquire it automatically
     /// when it is not held (then release at the end of their own write).
+    ///
+    /// Error contract (WS-03): [`Error::Busy`] only on contention (another
+    /// wsecret writer currently holds the mutex); mutex creation/wait
+    /// failures preserve their OS error in [`Error::Io`].
     pub fn lock_writers(&mut self) -> Result<MutexOutcome, Error> {
         if self.mutex.is_none() {
             let canonical = winfile::final_path(&self.file).map_err(io_err)?;
@@ -542,20 +656,74 @@ impl Store {
     /// as the reusable tombstone slot, and an existing record with this name
     /// is an error (`Secret %s exists!`). `NotFound::decrypted_any` carries
     /// upstream `pass_ok` for the confirmation gate.
+    ///
+    /// The matched record's value is materialized exactly once, into a
+    /// zeroizing [`SecretBytes`] owner. When only existence or the slot is
+    /// needed, use [`Store::find_meta`] — there the value never leaves the
+    /// scan buffer.
     pub fn find(&mut self, s: &Session, name: &[u8], create: bool) -> Result<ScanOutcome, Error> {
         let mut payload = [0u8; ENTRY_PLAIN_LEN];
-        let result = self.find_inner(s, name, create, &mut payload);
+        let result = self
+            .lookup(s, name, create, &mut payload, |slot, entry| {
+                Ok(ScanOutcome::Found {
+                    slot,
+                    name: entry.name.to_vec(),
+                    value: SecretBytes::from_slice(entry.value)?,
+                })
+            })
+            .map(|hit| match hit {
+                Lookup::Found(outcome) => outcome,
+                Lookup::NotFound {
+                    tombstone,
+                    decrypted_any,
+                } => ScanOutcome::NotFound {
+                    tombstone,
+                    decrypted_any,
+                },
+            });
         libhydrogen_sys::memzero(&mut payload);
         result
     }
 
-    fn find_inner(
+    /// Metadata-only first-match lookup: the same scan, matching and error
+    /// semantics as [`Store::find`], but the record value is never copied
+    /// out of the (zeroized) scan buffer. The right call for existence
+    /// probes (`create` checks) and slot-only rewrites (renew).
+    pub fn find_meta(&mut self, s: &Session, name: &[u8], create: bool) -> Result<ScanMeta, Error> {
+        let mut payload = [0u8; ENTRY_PLAIN_LEN];
+        let result = self
+            .lookup(s, name, create, &mut payload, |slot, entry| {
+                Ok(ScanMeta::Found {
+                    slot,
+                    name: entry.name.to_vec(),
+                })
+            })
+            .map(|hit| match hit {
+                Lookup::Found(meta) => meta,
+                Lookup::NotFound {
+                    tombstone,
+                    decrypted_any,
+                } => ScanMeta::NotFound {
+                    tombstone,
+                    decrypted_any,
+                },
+            });
+        libhydrogen_sys::memzero(&mut payload);
+        result
+    }
+
+    /// Shared first-match scan (upstream `s_get_secret`) behind
+    /// [`Store::find`] and [`Store::find_meta`]: `on_found` projects the
+    /// matched record while the decrypted payload is alive, so each caller
+    /// copies out exactly what it needs and nothing else.
+    fn lookup<T>(
         &mut self,
         s: &Session,
         name: &[u8],
         create: bool,
         payload: &mut [u8; ENTRY_PLAIN_LEN],
-    ) -> Result<ScanOutcome, Error> {
+        on_found: impl FnOnce(u64, &Entry<'_>) -> Result<T, Error>,
+    ) -> Result<Lookup<T>, Error> {
         check_name(name)?;
         let len = name.len();
         let mut block = [0u8; BLOCK];
@@ -583,17 +751,13 @@ impl Store {
                         return Err(Error::Name(NameError::Exists));
                     }
                     let entry = Entry::decode(payload).map_err(Error::from)?;
-                    return Ok(ScanOutcome::Found {
-                        slot: offset,
-                        name: entry.name.to_vec(),
-                        value: entry.value.to_vec(),
-                    });
+                    return Ok(Lookup::Found(on_found(offset, &entry)?));
                 }
                 decrypted_any = true;
             }
             offset += BLOCK as u64;
         }
-        Ok(ScanOutcome::NotFound {
+        Ok(Lookup::NotFound {
             tombstone: if create { tombstone } else { None },
             decrypted_any,
         })
@@ -993,7 +1157,7 @@ mod tests {
             ScanOutcome::Found { slot, name, value } => {
                 assert_eq!(slot, 3 * BLOCK as u64);
                 assert_eq!(name, b"beta");
-                assert_eq!(value, b"two");
+                assert_eq!(value.as_slice(), b"two");
             }
             other => panic!("expected Found, got {other:?}"),
         }
@@ -1007,13 +1171,13 @@ mod tests {
             Ok(ScanOutcome::NotFound { .. })
         ));
         // Missing name: pass_ok (decrypted_any) is set, no tombstone.
-        assert_eq!(
+        assert!(matches!(
             store.find(&s, b"missing", false).unwrap(),
             ScanOutcome::NotFound {
                 tombstone: None,
                 decrypted_any: true,
             }
-        );
+        ));
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1024,13 +1188,13 @@ mod tests {
         let (mut store, _) = Store::open(&path).unwrap();
         let s = session();
         // Nothing decryptable: confirmation gate sees decrypted_any == false.
-        assert_eq!(
+        assert!(matches!(
             store.find(&s, b"x", false).unwrap(),
             ScanOutcome::NotFound {
                 tombstone: None,
                 decrypted_any: false,
             }
-        );
+        ));
         std::fs::remove_file(&path).unwrap();
 
         // create=true tracks the FIRST tombstone only; create=false ignores
@@ -1046,20 +1210,20 @@ mod tests {
             &[],
         );
         let (mut store, _) = Store::open(&path).unwrap();
-        assert_eq!(
+        assert!(matches!(
             store.find(&s, b"fresh", true).unwrap(),
             ScanOutcome::NotFound {
-                tombstone: Some(BLOCK as u64),
+                tombstone: Some(offset),
                 decrypted_any: true,
-            }
-        );
-        assert_eq!(
+            } if offset == BLOCK as u64
+        ));
+        assert!(matches!(
             store.find(&s, b"fresh", false).unwrap(),
             ScanOutcome::NotFound {
                 tombstone: None,
                 decrypted_any: true,
             }
-        );
+        ));
         // create=true with the name already present: upstream "Secret %s
         // exists!".
         assert!(matches!(
@@ -1112,7 +1276,7 @@ mod tests {
         match store.find(&s, b"fresh", false).unwrap() {
             ScanOutcome::Found { slot, value, .. } => {
                 assert_eq!(slot, tombstone);
-                assert_eq!(value, b"v");
+                assert_eq!(value.as_slice(), b"v");
             }
             other => panic!("expected Found, got {other:?}"),
         }
@@ -1121,7 +1285,7 @@ mod tests {
             Ok(ScanOutcome::NotFound { .. })
         ));
         match store.find(&s, b"keep", false).unwrap() {
-            ScanOutcome::Found { value, .. } => assert_eq!(value, b"k"),
+            ScanOutcome::Found { value, .. } => assert_eq!(value.as_slice(), b"k"),
             other => panic!("expected Found, got {other:?}"),
         }
         std::fs::remove_file(&path).unwrap();
@@ -1156,11 +1320,11 @@ mod tests {
             "the untouched slot must be byte-identical"
         );
         match store.find(&s, b"alpha", false).unwrap() {
-            ScanOutcome::Found { value, .. } => assert_eq!(value, b"changed"),
+            ScanOutcome::Found { value, .. } => assert_eq!(value.as_slice(), b"changed"),
             other => panic!("expected Found, got {other:?}"),
         }
         match store.find(&s, b"beta", false).unwrap() {
-            ScanOutcome::Found { value, .. } => assert_eq!(value, b"two"),
+            ScanOutcome::Found { value, .. } => assert_eq!(value.as_slice(), b"two"),
             other => panic!("expected Found, got {other:?}"),
         }
 
@@ -1195,12 +1359,12 @@ mod tests {
         match store.find(&s, b"new", false).unwrap() {
             ScanOutcome::Found { slot, value, .. } => {
                 assert_eq!(slot, 2 * BLOCK as u64);
-                assert_eq!(value, b"val");
+                assert_eq!(value.as_slice(), b"val");
             }
             other => panic!("expected Found, got {other:?}"),
         }
         match store.find(&s, b"alpha", false).unwrap() {
-            ScanOutcome::Found { value, .. } => assert_eq!(value, b"one"),
+            ScanOutcome::Found { value, .. } => assert_eq!(value.as_slice(), b"one"),
             other => panic!("expected Found, got {other:?}"),
         }
         std::fs::remove_file(&path).unwrap();
@@ -1258,24 +1422,38 @@ mod tests {
     }
 
     #[test]
-    fn open_with_limits_enforces_the_opt_in_caps() {
+    fn open_with_limits_enforces_the_caps() {
         let path = temp_path("limits");
         fixture(&path, &[entry_block(b"alpha", b"one")], &[]);
 
-        // Default (unlimited) opens fine — the caps are opt-in (Hy4 P-3).
+        // The fixture header runs at OPS_LIMIT_DEFAULT (100000), well under
+        // the default policy ceiling: ordinary opens accept it.
         assert!(Store::open_with_limits(&path, Limits::default()).is_ok());
         assert!(Store::open_read_with_limits(&path, Limits::default()).is_ok());
 
-        // The fixture header runs at OPS_LIMIT_DEFAULT: just below rejects,
-        // exactly at the cap passes.
+        // Explicit caps: just below rejects with the full diagnosis, exactly
+        // at the cap passes.
         let under = Limits {
             max_opslimit: Some(OPS_LIMIT_DEFAULT - 1),
             max_store_bytes: None,
         };
-        assert!(matches!(
-            Store::open_with_limits(&path, under),
-            Err(Error::ResourceLimit)
-        ));
+        let err = match Store::open_with_limits(&path, under) {
+            Err(err) => err,
+            Ok(_) => panic!("under the cap must reject"),
+        };
+        let diagnosis = match err {
+            Error::ResourceLimit(diagnosis) => diagnosis,
+            other => panic!("want ResourceLimit, got {other:?}"),
+        };
+        assert_eq!(
+            diagnosis,
+            LimitExceeded {
+                kind: LimitKind::OpsLimit,
+                actual: OPS_LIMIT_DEFAULT,
+                limit: OPS_LIMIT_DEFAULT - 1,
+                remedy: LimitRemedy::AllowExpensiveKdf,
+            }
+        );
         let exact = Limits {
             max_opslimit: Some(OPS_LIMIT_DEFAULT),
             max_store_bytes: None,
@@ -1288,16 +1466,109 @@ mod tests {
             max_opslimit: None,
             max_store_bytes: Some(len - 1),
         };
-        assert!(matches!(
-            Store::open_read_with_limits(&path, over),
-            Err(Error::ResourceLimit)
-        ));
+        let err = match Store::open_read_with_limits(&path, over) {
+            Err(err) => err,
+            Ok(_) => panic!("over the size cap must reject"),
+        };
+        let diagnosis = match err {
+            Error::ResourceLimit(diagnosis) => diagnosis,
+            other => panic!("want ResourceLimit, got {other:?}"),
+        };
+        assert_eq!(
+            diagnosis,
+            LimitExceeded {
+                kind: LimitKind::StoreBytes,
+                actual: len,
+                limit: len - 1,
+                remedy: LimitRemedy::CallerConfigured,
+            }
+        );
         let fit = Limits {
             max_opslimit: None,
             max_store_bytes: Some(len),
         };
         assert!(Store::open_read_with_limits(&path, fit).is_ok());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn default_policy_caps_opslimit_at_one_million() {
+        // Boundary: the ceiling itself is accepted by an ordinary open.
+        let at = temp_path("limits-max-at");
+        std::fs::write(&at, Header::encode_init([0x2a; 32], OPS_LIMIT_MAX)).unwrap();
+        assert!(Store::open(&at).is_ok());
+        assert!(Store::open_read(&at).is_ok());
+
+        // One step above the ceiling rejects before any KDF execution (the
+        // open never derives) with the full diagnosis.
+        let over = temp_path("limits-max-over");
+        std::fs::write(&over, Header::encode_init([0x2a; 32], OPS_LIMIT_MAX + 1)).unwrap();
+        for result in [Store::open(&over), Store::open_read(&over)] {
+            let err = match result {
+                Err(err) => err,
+                Ok(_) => panic!("above the default ceiling must reject"),
+            };
+            let diagnosis = match err {
+                Error::ResourceLimit(diagnosis) => diagnosis,
+                other => panic!("want ResourceLimit, got {other:?}"),
+            };
+            assert_eq!(
+                diagnosis,
+                LimitExceeded {
+                    kind: LimitKind::OpsLimit,
+                    actual: OPS_LIMIT_MAX + 1,
+                    limit: OPS_LIMIT_MAX,
+                    remedy: LimitRemedy::AllowExpensiveKdf,
+                }
+            );
+        }
+
+        // The explicit override opens the same store; nothing is derived at
+        // open time, so acceptance here is proof the override is honored
+        // without expensive computation.
+        let (store, header) = Store::open_with_limits(&over, Limits::allow_expensive_kdf())
+            .expect("explicit override opens the above-ceiling store");
+        assert_eq!(header.ops_limit, OPS_LIMIT_MAX + 1);
+        assert_eq!(store.header(), &header);
+
+        // "normal minimum still applies": the override lifts only the
+        // ceiling — the format floor is still enforced at open.
+        let floor = temp_path("limits-floor");
+        std::fs::write(&floor, Header::encode_init([0x2a; 32], OPS_LIMIT_MIN - 1)).unwrap();
+        assert!(matches!(
+            Store::open_with_limits(&floor, Limits::allow_expensive_kdf()),
+            Err(Error::Format(FormatError::OpsLimitTooLow(9999)))
+        ));
+        std::fs::remove_file(&at).unwrap();
+        std::fs::remove_file(&over).unwrap();
+        std::fs::remove_file(&floor).unwrap();
+    }
+
+    #[test]
+    fn check_opslimit_is_the_shared_ceiling_gate() {
+        // Default policy: the ceiling is exactly OPS_LIMIT_MAX.
+        assert!(Limits::default().check_opslimit(OPS_LIMIT_MAX).is_ok());
+        let err = Limits::default()
+            .check_opslimit(OPS_LIMIT_MAX + 1)
+            .expect_err("above the ceiling");
+        // Full diagnosis: limit exceeded, numerical bound, explicit remedy.
+        let diagnosis = match err {
+            Error::ResourceLimit(diagnosis) => diagnosis,
+            other => panic!("want ResourceLimit, got {other:?}"),
+        };
+        assert_eq!(diagnosis.kind, LimitKind::OpsLimit);
+        assert_eq!(diagnosis.actual, OPS_LIMIT_MAX + 1);
+        assert_eq!(diagnosis.limit, OPS_LIMIT_MAX);
+        assert_eq!(diagnosis.remedy, LimitRemedy::AllowExpensiveKdf);
+
+        // The override constructor lifts the ceiling only.
+        let override_policy = Limits::allow_expensive_kdf();
+        assert_eq!(override_policy.max_opslimit, None);
+        assert_eq!(
+            override_policy.max_store_bytes,
+            Limits::default().max_store_bytes
+        );
+        assert!(override_policy.check_opslimit(u64::MAX).is_ok());
     }
 
     #[test]
@@ -1412,6 +1683,215 @@ mod tests {
         let receipt = store.append_or_reuse(None, &s, &name, &[0u8; 218]).unwrap();
         assert_eq!(receipt.state, CommitState::Committed);
         drop(store);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A record block whose raw bytes match `name` but which fails
+    /// structural validation (upstream `s_get_secret` matches it raw and
+    /// then fatals "Invalid secret"; our exact-match arm aborts with the
+    /// decode error).
+    fn poison_block(name: &[u8]) -> [u8; BLOCK] {
+        let mut payload = [0u8; ENTRY_PLAIN_LEN];
+        let data = &mut payload[2..2 + ENTRY_DATA_LEN];
+        data[..name.len()].copy_from_slice(name);
+        data[name.len()] = 0;
+        // `slen` past the data area: `Entry::decode` rejects the record.
+        payload[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        let mut block = [0u8; BLOCK];
+        libhydrogen_sys::secretbox_encrypt(
+            &mut block,
+            &payload,
+            &libhydrogen_sys::CTX_SECRET,
+            &KEY,
+        );
+        block
+    }
+
+    #[test]
+    fn find_meta_matches_find_without_materializing_the_value() {
+        let path = temp_path("meta");
+        fixture(
+            &path,
+            &[
+                entry_block(b"alpha", b"one"),
+                entry_block(b"DELETED:old", b"x"),
+            ],
+            &[],
+        );
+        let (mut store, _) = Store::open(&path).unwrap();
+        let s = session();
+
+        // Found: identical slot and name; `ScanMeta` has no value arm at
+        // all, so the record value can never leave the scan buffer through
+        // the metadata path.
+        let (slot, name, mut value) = match store.find(&s, b"alpha", false).unwrap() {
+            ScanOutcome::Found { slot, name, value } => (slot, name, value),
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(value.as_slice(), b"one");
+        assert_eq!(
+            store.find_meta(&s, b"alpha", false).unwrap(),
+            ScanMeta::Found {
+                slot,
+                name: name.clone(),
+            }
+        );
+
+        // NotFound parity in both create modes (tombstone + pass_ok).
+        assert_eq!(
+            store.find_meta(&s, b"fresh", true).unwrap(),
+            ScanMeta::NotFound {
+                tombstone: Some(2 * BLOCK as u64),
+                decrypted_any: true,
+            }
+        );
+        assert!(matches!(
+            store.find(&s, b"fresh", true).unwrap(),
+            ScanOutcome::NotFound {
+                tombstone: Some(t),
+                decrypted_any: true,
+            } if t == 2 * BLOCK as u64
+        ));
+        assert_eq!(
+            store.find_meta(&s, b"fresh", false).unwrap(),
+            ScanMeta::NotFound {
+                tombstone: None,
+                decrypted_any: true,
+            }
+        );
+
+        // create=true with the name present: upstream "Secret %s exists!".
+        assert!(matches!(
+            store.find_meta(&s, b"alpha", true),
+            Err(Error::Name(NameError::Exists))
+        ));
+        value.clear();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn find_value_owner_lifecycle_is_zeroizing() {
+        let path = temp_path("lifecycle");
+        fixture(&path, &[entry_block(b"alpha", b"synthetic-secret")], &[]);
+        let (mut store, _) = Store::open(&path).unwrap();
+        let s = session();
+
+        // Owned and readable through the zeroizing owner; `clear` erases
+        // in place and the buffer reports empty. The owner's lifecycle is
+        // independent of the record: a later lookup sees the same bytes.
+        let mut first = match store.find(&s, b"alpha", false).unwrap() {
+            ScanOutcome::Found { value, .. } => value,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(first.as_slice(), b"synthetic-secret");
+        first.clear();
+        assert!(first.is_empty());
+        assert_eq!(first.as_slice(), b"");
+
+        let second = match store.find(&s, b"alpha", false).unwrap() {
+            ScanOutcome::Found { value, .. } => value,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(second.as_slice(), b"synthetic-secret");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn lookup_debug_redacts_record_values() {
+        let path = temp_path("redacted");
+        fixture(&path, &[entry_block(b"alpha", b"super-secret")], &[]);
+        let (mut store, _) = Store::open(&path).unwrap();
+        let s = session();
+
+        let outcome = store.find(&s, b"alpha", false).unwrap();
+        let dbg = format!("{outcome:?}");
+        assert!(
+            dbg.contains("redacted"),
+            "value must render redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains("super-secret"),
+            "record value must not appear in Debug: {dbg}"
+        );
+        // Metadata is safe to log: the meta result shows name and slot
+        // (the name renders as its Debug byte list, e.g. `alpha` →
+        // `[97, 108, 112, 104, 97]`).
+        let meta = store.find_meta(&s, b"alpha", false).unwrap();
+        let meta_dbg = format!("{meta:?}");
+        assert!(
+            meta_dbg.contains("97, 108, 112, 104, 97"),
+            "metadata stays visible: {meta_dbg}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn lookup_rejects_invalid_names_before_the_scan() {
+        // The fixture holds a poison record whose raw bytes match the
+        // invalid name `bad name`, plus a poison record with a VALID name as
+        // the control: a scan that reached the match would report
+        // Exists/MalformedRecord, never a name-rule error.
+        let path = temp_path("early");
+        fixture(
+            &path,
+            &[poison_block(b"bad name"), poison_block(b"good")],
+            &[],
+        );
+        let (mut store, _) = Store::open(&path).unwrap();
+        let s = session();
+
+        for create in [false, true] {
+            for probe in [
+                store.find(&s, b"", create),
+                store.find(&s, b"has space", create),
+                store.find(&s, &[b'n'; 256], create),
+            ] {
+                let err = probe.expect_err("invalid names must be rejected");
+                assert!(
+                    matches!(
+                        err,
+                        Error::Name(NameError::Empty | NameError::SpecialChar | NameError::TooLong)
+                    ),
+                    "expected a name-rule error, got {err:?}"
+                );
+            }
+            for probe in [
+                store.find_meta(&s, b"", create),
+                store.find_meta(&s, b"has space", create),
+                store.find_meta(&s, &[b'n'; 256], create),
+            ] {
+                let err = probe.expect_err("invalid names must be rejected");
+                assert!(
+                    matches!(
+                        err,
+                        Error::Name(NameError::Empty | NameError::SpecialChar | NameError::TooLong)
+                    ),
+                    "expected a name-rule error, got {err:?}"
+                );
+            }
+        }
+        // The name rule wins even where a raw match would have produced
+        // upstream's `Secret %s exists!` (create=true against the poison
+        // `bad name` record).
+        assert!(matches!(
+            store.find(&s, b"bad name", true),
+            Err(Error::Name(NameError::SpecialChar))
+        ));
+        assert!(matches!(
+            store.find_meta(&s, b"bad name", true),
+            Err(Error::Name(NameError::SpecialChar))
+        ));
+
+        // Control: the scan is live — the poison record under a VALID name
+        // aborts at the exact-match arm with the structural error.
+        assert!(matches!(
+            store.find(&s, b"good", false),
+            Err(Error::Format(FormatError::MalformedRecord))
+        ));
+        assert!(matches!(
+            store.find_meta(&s, b"good", false),
+            Err(Error::Format(FormatError::MalformedRecord))
+        ));
         std::fs::remove_file(&path).unwrap();
     }
 }

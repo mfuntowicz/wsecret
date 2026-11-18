@@ -27,10 +27,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use support::{file_hash, file_len, temp_dir, unlock, value_of, PASS_A};
-use wsecret_core::error::{
-    Status, WARN_POST_COMMIT_CANCELLED, WARN_POST_COMMIT_PANIC,
-};
+use support::{PASS_A, file_hash, file_len, temp_dir, unlock, value_of};
+use wsecret_core::error::{Status, WARN_POST_COMMIT_CANCELLED, WARN_POST_COMMIT_PANIC};
 use wsecret_core::fault::{self, Fault, Point};
 use wsecret_core::format::OPS_LIMIT_MIN;
 use wsecret_core::session::Session;
@@ -83,7 +81,10 @@ fn assert_failure(failure: &CommitFailure, status: u32, state: CommitState, what
         status,
         "{what}: status mismatch: {failure:?}"
     );
-    assert_eq!(failure.state, state, "{what}: commit state mismatch: {failure:?}");
+    assert_eq!(
+        failure.state, state,
+        "{what}: commit state mismatch: {failure:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +169,10 @@ fn u5_between_ii_and_iii_overwrite() {
         }
         // The write completed: the new record is visible (page cache);
         // durability after a crash is filesystem-dependent (not claimed).
-        assert_eq!(value_of(&mut store, &session, b"keep").unwrap(), b"KEEP-NEW\n");
+        assert_eq!(
+            value_of(&mut store, &session, b"keep").unwrap().as_slice(),
+            b"KEEP-NEW\n"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
@@ -191,7 +195,10 @@ fn u5_after_checkpoint_iii_overwrite_warning_bits() {
         );
         disarm();
     }
-    assert_eq!(value_of(&mut store, &session, b"keep").unwrap(), b"KEEP-NEW\n");
+    assert_eq!(
+        value_of(&mut store, &session, b"keep").unwrap().as_slice(),
+        b"KEEP-NEW\n"
+    );
     let _ = fs::remove_dir_all(&dir);
 
     // Post-commit cancellation → OK/Committed + warning bit 1.
@@ -209,7 +216,10 @@ fn u5_after_checkpoint_iii_overwrite_warning_bits() {
         );
         disarm();
     }
-    assert_eq!(value_of(&mut store, &session, b"keep").unwrap(), b"KEEP-NEW\n");
+    assert_eq!(
+        value_of(&mut store, &session, b"keep").unwrap().as_slice(),
+        b"KEEP-NEW\n"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -294,7 +304,10 @@ fn u5_after_checkpoint_iii_append_warning_bits() {
         assert_eq!(receipt.warnings, WARN_POST_COMMIT_PANIC);
         disarm();
     }
-    assert_eq!(value_of(&mut store, &session, b"new").unwrap(), b"NEW\n");
+    assert_eq!(
+        value_of(&mut store, &session, b"new").unwrap().as_slice(),
+        b"NEW\n"
+    );
     let _ = fs::remove_dir_all(&dir);
 
     let (dir, path) = seed("u5-post-app-cancel");
@@ -308,7 +321,10 @@ fn u5_after_checkpoint_iii_append_warning_bits() {
         assert_eq!(receipt.warnings, WARN_POST_COMMIT_CANCELLED);
         disarm();
     }
-    assert_eq!(value_of(&mut store, &session, b"new").unwrap(), b"NEW\n");
+    assert_eq!(
+        value_of(&mut store, &session, b"new").unwrap().as_slice(),
+        b"NEW\n"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -361,8 +377,15 @@ fn c16b_create_failure_rows_use_the_same_table() {
     let path = dir.join("store.secret");
     {
         arm_seam(Point::BeforeWrite, Fault::Io);
-        let failure = Store::create(&path, OPS_LIMIT_MIN).err().expect("must fail");
-        assert_failure(&failure, STATUS_IO, CommitState::NotCommitted, "init before (i)");
+        let failure = Store::create(&path, OPS_LIMIT_MIN)
+            .err()
+            .expect("must fail");
+        assert_failure(
+            &failure,
+            STATUS_IO,
+            CommitState::NotCommitted,
+            "init before (i)",
+        );
         disarm();
     }
     assert!(Store::open(&path).is_err(), "no readable store was created");
@@ -373,7 +396,9 @@ fn c16b_create_failure_rows_use_the_same_table() {
     let path = dir.join("store.secret");
     {
         arm_seam(Point::MidWrite, Fault::ShortWrite);
-        let failure = Store::create(&path, OPS_LIMIT_MIN).err().expect("must fail");
+        let failure = Store::create(&path, OPS_LIMIT_MIN)
+            .err()
+            .expect("must fail");
         assert_failure(&failure, STATUS_IO, CommitState::Unknown, "init (i)–(ii)");
         disarm();
     }
@@ -387,7 +412,9 @@ fn c16b_create_failure_rows_use_the_same_table() {
     let path = dir.join("store.secret");
     {
         arm_seam(Point::AfterWrite, Fault::Io);
-        let failure = Store::create(&path, OPS_LIMIT_MIN).err().expect("must fail");
+        let failure = Store::create(&path, OPS_LIMIT_MIN)
+            .err()
+            .expect("must fail");
         assert_failure(&failure, STATUS_IO, CommitState::Unknown, "init (ii)–(iii)");
         disarm();
     }

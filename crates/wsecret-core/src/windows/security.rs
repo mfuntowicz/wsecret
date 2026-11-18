@@ -1,6 +1,7 @@
 //! Windows security primitives used by this slice: the
 //! `Global\wsecret-store-<64 hex>` writer mutex and its DACL (plan §3.5,
-//! §5.6 point 1).
+//! §5.6 point 1), the `Global\wsecret-sshkey-<64 hex>` per-identity lock for
+//! `SshLaunch` (WS-03), and the shared aligned DACL machinery both use.
 //!
 //! Store-file DACLs plus the plan §5.8 process/thread protection boundary:
 //! startup hardening, `OWNER_RIGHTS`, hardened thread creation, unlock
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SE_KERNEL_OBJECT, SetSecurityInfo,
@@ -26,7 +27,7 @@ use windows_sys::Win32::Security::{
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, InitializeAcl, InitializeSecurityDescriptor,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid,
     WinLocalSystemSid,
 };
@@ -35,7 +36,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateEventW, CreateMutexW, CreateThread, ExitProcess, GetCurrentProcess,
+    CREATE_SUSPENDED, CreateEventW, CreateMutexExW, CreateThread, ExitProcess, GetCurrentProcess,
     GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, INFINITE, LPTHREAD_START_ROUTINE,
     MUTEX_MODIFY_STATE, OpenThread, PROCESS_ALL_ACCESS, PROCESS_CREATE_PROCESS,
     PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION,
@@ -65,11 +66,23 @@ pub enum MutexOutcome {
     Abandoned,
 }
 
-/// Held `Global\wsecret-store-<64 hex>` writer mutex (RAII release on drop).
-pub struct WriterMutex {
-    handle: HANDLE,
-    /// True when acquisition was `WAIT_ABANDONED`.
-    pub abandoned: bool,
+impl MutexOutcome {
+    fn from_abandoned(abandoned: bool) -> Self {
+        if abandoned {
+            MutexOutcome::Abandoned
+        } else {
+            MutexOutcome::Acquired
+        }
+    }
+}
+
+fn hex_name(prefix: &str, digest: &[u8; 32]) -> String {
+    let mut name = String::from(prefix);
+    use std::fmt::Write as _;
+    for b in digest {
+        let _ = write!(name, "{b:02x}");
+    }
+    name
 }
 
 /// Derives `Global\wsecret-store-<64 hex>` from the canonical final path
@@ -79,30 +92,98 @@ pub fn writer_mutex_name(canonical_path: &[u8]) -> String {
     const CTX_WSTLOCK1: [u8; 8] = *b"WSTLOCK1";
     let mut digest = [0u8; 32];
     libhydrogen_sys::hash(&mut digest, canonical_path, &CTX_WSTLOCK1);
-    let mut name = String::from("Global\\wsecret-store-");
-    use std::fmt::Write as _;
-    for b in digest {
-        let _ = write!(name, "{b:02x}");
-    }
-    name
+    hex_name("Global\\wsecret-store-", &digest)
 }
 
-/// Keeps the SID/ACL buffers alive alongside the descriptor.
+/// DWORD-aligned heap storage for kernel SID/ACL data. The SID and ACL
+/// structures require 4-byte alignment, which `Vec<u8>`/`[u8; N]` do not
+/// promise; the allocation address is also stable when the owning struct
+/// moves, so a `SECURITY_DESCRIPTOR` may keep pointing into it until drop
+/// (WS-03: the previous stack-array backing moved when the owner was
+/// returned by value, leaving the descriptor's DACL pointer dangling before
+/// `CreateMutexExW`).
+struct AlignedBuf {
+    words: Vec<u32>,
+    len: usize,
+}
+
+impl AlignedBuf {
+    /// `len` zeroed bytes of DWORD-aligned storage.
+    fn new_zeroed(len: usize) -> Self {
+        Self {
+            words: vec![0u32; len.div_ceil(4)],
+            len,
+        }
+    }
+
+    /// An aligned copy of `bytes`.
+    fn copy_of(bytes: &[u8]) -> Self {
+        let mut buf = Self::new_zeroed(bytes.len());
+        buf.as_mut_slice().copy_from_slice(bytes);
+        buf
+    }
+
+    /// Shortens the logical length after an API reports the used size.
+    /// `len` must not exceed the current length.
+    fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len);
+        self.len = len;
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `words` is a valid allocation of `4 * words.len()` bytes,
+        // and `len <= 4 * words.len()` by construction.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.len) }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.words.as_mut_ptr() as *mut u8
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.words.as_ptr() as *const u8
+    }
+
+    /// PSID view for the Windows SID APIs.
+    fn as_psid(&self) -> PSID {
+        self.words.as_ptr() as PSID
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// 8-byte ACL header + two standard allow/deny ACEs, each at most
+/// `ACE_HEADER + ACCESS_MASK + SECURITY_MAX_SID_SIZE` bytes.
+const MUTEX_ACL_LEN: usize = 8 + 2 * (8 + SECURITY_MAX_SID_SIZE as usize);
+
+// Request only the rights the DACL grants. CreateMutexW would request
+// MUTEX_ALL_ACCESS when a cooperating writer already has the mutex open.
+const MUTEX_ACCESS: u32 = SYNCHRONIZE | MUTEX_MODIFY_STATE;
+
+/// The user+SYSTEM `SYNCHRONIZE | MUTEX_MODIFY_STATE` DACL shared by the
+/// store writer mutex and the per-identity lock (spec §5.6 point 1; WS-03).
+/// Every SID/ACL buffer is a [`AlignedBuf`] heap allocation whose address is
+/// stable while this value lives, and the descriptor is built against those
+/// final addresses, so [`MutexSecurity::attributes`] remains valid until
+/// drop regardless of how often the owner moves.
 struct MutexSecurity {
-    _user_sid: Vec<u8>,
-    _system_sid: [u8; 68],
-    _acl: [u8; 128],
+    _user_sid: AlignedBuf,
+    _system_sid: AlignedBuf,
+    acl: AlignedBuf,
     sd: SECURITY_DESCRIPTOR,
 }
 
 /// Builds the mutex DACL: current user + SYSTEM, `SYNCHRONIZE |
-/// MUTEX_MODIFY_STATE` (spec §5.6 point 1).
+/// MUTEX_MODIFY_STATE`, DACL-protected so no inheritable ACE from the
+/// `Global\` namespace can merge an extra grant in (spec §5.6 point 1).
 fn mutex_security() -> io::Result<MutexSecurity> {
-    let user_sid = super::file::current_user_sid()?;
-    let mut system_sid = [0u8; 68];
+    let user_sid = AlignedBuf::copy_of(&super::file::current_user_sid()?);
+    let mut system_sid = AlignedBuf::new_zeroed(SECURITY_MAX_SID_SIZE as usize);
+    let mut sys_len = system_sid.len() as u32;
     // SAFETY: buffer is valid for a maximum-size SID; the resulting length is
     // checked by the call's return value.
-    let mut sys_len = system_sid.len() as u32;
     if unsafe {
         CreateWellKnownSid(
             WinLocalSystemSid,
@@ -114,20 +195,37 @@ fn mutex_security() -> io::Result<MutexSecurity> {
     {
         return Err(io::Error::last_os_error());
     }
+    system_sid.truncate(sys_len as usize);
 
-    let mut acl = [0u8; 128];
-    // SAFETY: 128 bytes fits an ACL header + two small allow ACEs.
-    if unsafe { InitializeAcl(acl.as_mut_ptr() as *mut ACL, acl.len() as u32, ACL_REVISION) } == 0 {
+    // Assemble the owner first so every pointer the descriptor records is
+    // already the final heap address (Vec allocations do not move with the
+    // owning struct).
+    let mut sec = MutexSecurity {
+        _user_sid: user_sid,
+        _system_sid: system_sid,
+        acl: AlignedBuf::new_zeroed(MUTEX_ACL_LEN),
+        sd: SECURITY_DESCRIPTOR::default(),
+    };
+    // SAFETY: the ACL buffer is writable, DWORD-aligned, and sized for the
+    // two ACEs added below (maximum-size SIDs included).
+    if unsafe {
+        InitializeAcl(
+            sec.acl.as_mut_ptr() as *mut ACL,
+            sec.acl.len() as u32,
+            ACL_REVISION,
+        )
+    } == 0
+    {
         return Err(io::Error::last_os_error());
     }
-    let access = SYNCHRONIZE | MUTEX_MODIFY_STATE;
-    // SAFETY: SID pointers are valid; the ACL was just initialized.
+    // SAFETY: SID pointers are valid; the ACL was just initialized and the
+    // SID buffers outlive the ACE copies they seed.
     if unsafe {
         AddAccessAllowedAce(
-            acl.as_mut_ptr() as *mut ACL,
+            sec.acl.as_mut_ptr() as *mut ACL,
             ACL_REVISION,
-            access,
-            user_sid.as_ptr() as PSID,
+            MUTEX_ACCESS,
+            sec._user_sid.as_psid(),
         )
     } == 0
     {
@@ -135,111 +233,203 @@ fn mutex_security() -> io::Result<MutexSecurity> {
     }
     if unsafe {
         AddAccessAllowedAce(
-            acl.as_mut_ptr() as *mut ACL,
+            sec.acl.as_mut_ptr() as *mut ACL,
             ACL_REVISION,
-            access,
-            system_sid.as_ptr() as PSID,
+            MUTEX_ACCESS,
+            sec._system_sid.as_psid(),
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
     }
 
-    let mut sd = SECURITY_DESCRIPTOR::default();
     // SAFETY: `sd` is a correctly typed SECURITY_DESCRIPTOR; revision 1.
     if unsafe {
         InitializeSecurityDescriptor(
-            &mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
+            &mut sec.sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
             SECURITY_DESCRIPTOR_REVISION,
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `sd` is initialized; the ACL outlives it via MutexSecurity.
+    // Birth descriptors do not receive SetSecurityInfo's separate
+    // PROTECTED_DACL flag, so the descriptor itself must carry the bit: it
+    // is what guarantees "no additional grants" survives kernel-side
+    // inheritance processing at object creation.
+    // SAFETY: `sd` is initialized and the control mask is exact.
+    if unsafe {
+        SetSecurityDescriptorControl(
+            &mut sec.sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `sec.acl` is the final heap allocation and stays alive with
+    // `sec`; the descriptor keeps pointing at it until drop.
     if unsafe {
         SetSecurityDescriptorDacl(
-            &mut sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
+            &mut sec.sd as *mut SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
             1,
-            acl.as_ptr() as *const ACL,
+            sec.acl.as_ptr() as *const ACL,
             0,
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(MutexSecurity {
-        _user_sid: user_sid,
-        _system_sid: system_sid,
-        _acl: acl,
-        sd,
-    })
+    Ok(sec)
+}
+
+impl MutexSecurity {
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: &self.sd as *const SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+/// Held `Global\wsecret-store-<64 hex>` writer mutex (RAII release on drop).
+/// Windows mutex ownership is thread-bound: acquire and drop it on the same
+/// thread.
+pub struct WriterMutex {
+    handle: HANDLE,
+    /// True when acquisition was `WAIT_ABANDONED`.
+    pub abandoned: bool,
+}
+
+/// Creates/opens the named mutex `name` non-inheritably with the user+SYSTEM
+/// DACL and takes ownership with a zero-timeout wait. Returns
+/// `(handle, abandoned)`.
+///
+/// Error contract (WS-03): [`Error::Busy`] ONLY on contention
+/// (`WAIT_TIMEOUT`); creation/open/wait failures preserve their OS error in
+/// [`Error::Io`] and are never reported as `Busy`.
+fn acquire_mutex_handle(name: &str) -> Result<(HANDLE, bool), Error> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let sec = mutex_security().map_err(Error::Io)?;
+    let sa = sec.attributes();
+    // SAFETY: `sa` and `wide` are valid; the handle is checked below. The
+    // kernel copies the security descriptor at creation, and `sec` keeps its
+    // aligned SID/ACL backing alive until this call returns.
+    let handle = unsafe { CreateMutexExW(&sa, wide.as_ptr(), 0, MUTEX_ACCESS) };
+    if handle.is_null() {
+        // Creation/open failure (a squatted name with a hostile DACL, a name
+        // collision with a foreign object type, ...): the OS error is the
+        // diagnosis. This is NOT contention.
+        return Err(Error::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: fresh valid handle; zero timeout = non-blocking acquire.
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => Ok((handle, false)),
+        // The previous owner died holding it: we own it now, without an
+        // integrity claim.
+        WAIT_ABANDONED => Ok((handle, true)),
+        WAIT_TIMEOUT => {
+            // Contention: the ONLY `Error::Busy` source. We never own it, so
+            // release nothing, just close the handle.
+            // SAFETY: owned, unowned-by-us handle.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            Err(Error::Busy)
+        }
+        // WAIT_FAILED or any unexpected status: preserve the OS error
+        // (captured before CloseHandle can overwrite it).
+        wait => {
+            debug_assert_eq!(wait, WAIT_FAILED, "unexpected wait status");
+            let error = io::Error::last_os_error();
+            // SAFETY: owned, unowned-by-us handle.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            Err(Error::Io(error))
+        }
+    }
+}
+
+/// Releases and closes a mutex handle owned by the calling thread.
+fn release_mutex_handle(handle: HANDLE) {
+    // SAFETY: owned handle; release then close; never panics.
+    unsafe {
+        let _ = ReleaseMutex(handle);
+        let _ = CloseHandle(handle);
+    }
 }
 
 impl WriterMutex {
     /// Creates/opens `Global\wsecret-store-<64 hex>` non-inheritably with the
     /// user+SYSTEM DACL and waits with zero timeout (spec §5.6 point 1).
     ///
-    /// `Error::Busy` on timeout or acquisition failure; `Error::Io` only for
-    /// descriptor-construction failures.
+    /// [`Error::Busy`] ONLY on contention (another owner holds the mutex);
+    /// creation/wait failures preserve their OS error in [`Error::Io`].
     pub fn acquire(canonical_path: &[u8]) -> Result<WriterMutex, Error> {
-        let name = writer_mutex_name(canonical_path);
-        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        let sec = mutex_security().map_err(Error::Io)?;
-
-        let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
-                as u32,
-            lpSecurityDescriptor: &sec.sd as *const SECURITY_DESCRIPTOR as *mut core::ffi::c_void,
-            bInheritHandle: 0,
-        };
-        // SAFETY: `sa` and `wide` are valid; the handle is checked below. The
-        // kernel copies the security descriptor at creation, so `sec` only
-        // needs to outlive this call.
-        let handle = unsafe { CreateMutexW(&sa, 0, wide.as_ptr()) };
-        drop(sec);
-        if handle.is_null() {
-            return Err(Error::Busy);
-        }
-        // SAFETY: fresh valid handle; zero timeout = non-blocking acquire.
-        let outcome = unsafe { WaitForSingleObject(handle, 0) };
-        match outcome {
-            0x0000 => Ok(WriterMutex {
-                handle,
-                abandoned: false,
-            }), // WAIT_OBJECT_0
-            0x0080 => Ok(WriterMutex {
-                handle,
-                abandoned: true,
-            }), // WAIT_ABANDONED
-            _ => {
-                // WAIT_TIMEOUT / WAIT_FAILED: release nothing, close handle.
-                // SAFETY: owned, unowned-by-us handle.
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                Err(Error::Busy)
-            }
-        }
+        let (handle, abandoned) = acquire_mutex_handle(&writer_mutex_name(canonical_path))?;
+        Ok(WriterMutex { handle, abandoned })
     }
 
     /// The acquisition outcome (for the §5.6 integrity claim).
     pub fn outcome(&self) -> MutexOutcome {
-        if self.abandoned {
-            MutexOutcome::Abandoned
-        } else {
-            MutexOutcome::Acquired
-        }
+        MutexOutcome::from_abandoned(self.abandoned)
     }
 }
 
 impl Drop for WriterMutex {
     fn drop(&mut self) {
-        // SAFETY: owned handle; release then close; never panics.
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
-        }
+        release_mutex_handle(self.handle);
+    }
+}
+
+/// Derives the `Global\wsecret-sshkey-<64 hex>` per-identity lock name for
+/// `SshLaunch` (WS-03): `hydro_hash_hash` over `current_user_sid() ||
+/// public_key` under context `WSSHKEY1`. Hashing the user SID in keeps
+/// same-public-key identities of different users disjoint in the `Global\`
+/// namespace; the name depends on neither session nor store and carries no
+/// key material (hash output only).
+pub fn identity_lock_name(public_key: &[u8; 32]) -> Result<String, Error> {
+    const CTX_WSSHKEY1: [u8; 8] = *b"WSSHKEY1";
+    let mut scope = super::file::current_user_sid().map_err(Error::Io)?;
+    scope.extend_from_slice(public_key);
+    let mut digest = [0u8; 32];
+    libhydrogen_sys::hash(&mut digest, &scope, &CTX_WSSHKEY1);
+    Ok(hex_name("Global\\wsecret-sshkey-", &digest))
+}
+
+/// Held per-identity `Global\wsecret-sshkey-<64 hex>` lock for `SshLaunch`
+/// (RAII release on drop). Windows mutex ownership is thread-bound: acquire
+/// and drop it on the same thread.
+pub struct IdentityLock {
+    handle: HANDLE,
+    /// True when acquisition was `WAIT_ABANDONED`.
+    pub abandoned: bool,
+}
+
+impl IdentityLock {
+    /// Takes the per-identity lock keyed by the Ed25519 public key
+    /// ([`identity_lock_name`]) with a zero-timeout wait: exclusive and
+    /// immediate.
+    ///
+    /// [`Error::Busy`] ONLY on contention (another holder owns the lock);
+    /// creation/wait failures preserve their OS error in [`Error::Io`].
+    pub fn acquire(public_key: &[u8; 32]) -> Result<IdentityLock, Error> {
+        let (handle, abandoned) = acquire_mutex_handle(&identity_lock_name(public_key)?)?;
+        Ok(IdentityLock { handle, abandoned })
+    }
+
+    /// The acquisition outcome (same contract as [`WriterMutex::outcome`]).
+    pub fn outcome(&self) -> MutexOutcome {
+        MutexOutcome::from_abandoned(self.abandoned)
+    }
+}
+
+impl Drop for IdentityLock {
+    fn drop(&mut self) {
+        release_mutex_handle(self.handle);
     }
 }
 
@@ -312,18 +502,21 @@ impl ObjectKind {
 }
 
 /// Owns every buffer referenced by the absolute security descriptor. The ACL
-/// and SID allocations have stable heap addresses when this value moves.
+/// and SID allocations are [`AlignedBuf`] heap buffers with stable addresses
+/// when this value moves (WS-03: same safe DACL machinery as the mutexes).
 struct ObjectSecurity {
-    _user_sid: Vec<u8>,
-    _owner_rights_sid: Vec<u8>,
-    _system_sid: Vec<u8>,
-    _admins_sid: Vec<u8>,
-    _acl: Vec<u8>,
+    _user_sid: AlignedBuf,
+    _owner_rights_sid: AlignedBuf,
+    _system_sid: AlignedBuf,
+    _admins_sid: AlignedBuf,
+    acl: AlignedBuf,
     sd: SECURITY_DESCRIPTOR,
 }
 
-fn well_known_sid(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
-    let mut sid = vec![0u8; 68];
+fn well_known_sid(
+    kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE,
+) -> io::Result<AlignedBuf> {
+    let mut sid = AlignedBuf::new_zeroed(SECURITY_MAX_SID_SIZE as usize);
     let mut len = sid.len() as u32;
     // SAFETY: `sid` is large enough for every well-known SID used here.
     if unsafe { CreateWellKnownSid(kind, ptr::null_mut(), sid.as_mut_ptr() as PSID, &mut len) } == 0
@@ -340,16 +533,27 @@ impl ObjectSecurity {
     }
 
     fn new_with_owner_rights(kind: ObjectKind, include_owner_rights: bool) -> io::Result<Self> {
-        let user_sid = super::file::current_user_sid()?;
-        let owner_rights_sid = well_known_sid(WinCreatorOwnerRightsSid)?;
-        let system_sid = well_known_sid(WinLocalSystemSid)?;
-        let admins_sid = well_known_sid(WinBuiltinAdministratorsSid)?;
-        // Four ACEs with maximum-size SIDs fit comfortably. A Vec avoids the
-        // fixed-size assumptions that made the mutex ACL need manual sizing.
-        let mut acl = vec![0u8; 1024];
-        // SAFETY: the ACL buffer is writable and large enough for four ACEs.
-        if unsafe { InitializeAcl(acl.as_mut_ptr() as *mut ACL, acl.len() as u32, ACL_REVISION) }
-            == 0
+        // Assemble the owner first so every pointer the descriptor records is
+        // already the final heap address (WS-03, same as `mutex_security`).
+        let mut sec = Self {
+            _user_sid: AlignedBuf::copy_of(&super::file::current_user_sid()?),
+            _owner_rights_sid: well_known_sid(WinCreatorOwnerRightsSid)?,
+            _system_sid: well_known_sid(WinLocalSystemSid)?,
+            _admins_sid: well_known_sid(WinBuiltinAdministratorsSid)?,
+            // 8-byte ACL header + four standard ACEs, each at most
+            // `ACE_HEADER + ACCESS_MASK + SECURITY_MAX_SID_SIZE` bytes.
+            acl: AlignedBuf::new_zeroed(8 + 4 * (8 + SECURITY_MAX_SID_SIZE as usize)),
+            sd: SECURITY_DESCRIPTOR::default(),
+        };
+        // SAFETY: the ACL buffer is writable, DWORD-aligned, and large enough
+        // for four maximum-size ACEs.
+        if unsafe {
+            InitializeAcl(
+                sec.acl.as_mut_ptr() as *mut ACL,
+                sec.acl.len() as u32,
+                ACL_REVISION,
+            )
+        } == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -358,10 +562,10 @@ impl ObjectSecurity {
         // SAFETY: all SID pointers remain live for the whole construction.
         if unsafe {
             AddAccessDeniedAce(
-                acl.as_mut_ptr() as *mut ACL,
+                sec.acl.as_mut_ptr() as *mut ACL,
                 ACL_REVISION,
                 kind.deny(),
-                user_sid.as_ptr() as PSID,
+                sec._user_sid.as_psid(),
             )
         } == 0
         {
@@ -369,18 +573,18 @@ impl ObjectSecurity {
         }
         let mut allowed = Vec::with_capacity(3);
         if include_owner_rights {
-            allowed.push((&owner_rights_sid, kind.owner_allow()));
+            allowed.push((&sec._owner_rights_sid, kind.owner_allow()));
         }
-        allowed.push((&system_sid, kind.full_control()));
-        allowed.push((&admins_sid, kind.full_control()));
+        allowed.push((&sec._system_sid, kind.full_control()));
+        allowed.push((&sec._admins_sid, kind.full_control()));
         for (sid, mask) in allowed {
             // SAFETY: initialized ACL; each SID is valid and outlives the call.
             if unsafe {
                 AddAccessAllowedAce(
-                    acl.as_mut_ptr() as *mut ACL,
+                    sec.acl.as_mut_ptr() as *mut ACL,
                     ACL_REVISION,
                     mask,
-                    sid.as_ptr() as PSID,
+                    sid.as_psid(),
                 )
             } == 0
             {
@@ -388,11 +592,10 @@ impl ObjectSecurity {
             }
         }
 
-        let mut sd = SECURITY_DESCRIPTOR::default();
         // SAFETY: `sd` has the exact SECURITY_DESCRIPTOR layout.
         if unsafe {
             InitializeSecurityDescriptor(
-                &mut sd as *mut SECURITY_DESCRIPTOR as *mut c_void,
+                &mut sec.sd as *mut SECURITY_DESCRIPTOR as *mut c_void,
                 SECURITY_DESCRIPTOR_REVISION,
             )
         } == 0
@@ -404,7 +607,7 @@ impl ObjectSecurity {
         // SAFETY: `sd` is initialized and the control mask is exact.
         if unsafe {
             SetSecurityDescriptorControl(
-                &mut sd as *mut SECURITY_DESCRIPTOR as *mut c_void,
+                &mut sec.sd as *mut SECURITY_DESCRIPTOR as *mut c_void,
                 SE_DACL_PROTECTED,
                 SE_DACL_PROTECTED,
             )
@@ -412,26 +615,20 @@ impl ObjectSecurity {
         {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the ACL allocation is retained in the returned value.
+        // SAFETY: `sec.acl` is the final heap allocation and stays alive with
+        // `sec`; the descriptor keeps pointing at it until drop.
         if unsafe {
             SetSecurityDescriptorDacl(
-                &mut sd as *mut SECURITY_DESCRIPTOR as *mut c_void,
+                &mut sec.sd as *mut SECURITY_DESCRIPTOR as *mut c_void,
                 1,
-                acl.as_ptr() as *const ACL,
+                sec.acl.as_ptr() as *const ACL,
                 0,
             )
         } == 0
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self {
-            _user_sid: user_sid,
-            _owner_rights_sid: owner_rights_sid,
-            _system_sid: system_sid,
-            _admins_sid: admins_sid,
-            _acl: acl,
-            sd,
-        })
+        Ok(sec)
     }
 
     fn attributes(&self) -> SECURITY_ATTRIBUTES {
@@ -466,7 +663,7 @@ fn apply_security(handle: HANDLE, security: &ObjectSecurity) -> io::Result<()> {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            security._acl.as_ptr() as *mut ACL,
+            security.acl.as_ptr() as *mut ACL,
             ptr::null_mut(),
         )
     };
@@ -518,7 +715,7 @@ fn verify_security(handle: HANDLE, kind: ObjectKind) -> io::Result<()> {
         {
             return Err(io::Error::from_raw_os_error(5));
         }
-        let user = super::file::current_user_sid()?;
+        let user = AlignedBuf::copy_of(&super::file::current_user_sid()?);
         let owner = well_known_sid(WinCreatorOwnerRightsSid)?;
         let system = well_known_sid(WinLocalSystemSid)?;
         let admins = well_known_sid(WinBuiltinAdministratorsSid)?;
@@ -546,9 +743,7 @@ fn verify_security(handle: HANDLE, kind: ObjectKind) -> io::Result<()> {
                 return Err(io::Error::from_raw_os_error(5));
             }
             // SAFETY: SidStart begins the variable-length SID in the ACE.
-            if unsafe { EqualSid(&(*ace).SidStart as *const u32 as PSID, sid.as_ptr() as PSID) }
-                == 0
-            {
+            if unsafe { EqualSid(&(*ace).SidStart as *const u32 as PSID, sid.as_psid()) } == 0 {
                 return Err(io::Error::from_raw_os_error(5));
             }
         }
@@ -1269,6 +1464,49 @@ mod tests {
         assert!(result);
         drop(held);
         let ok = std::thread::spawn(move || WriterMutex::acquire(&path).is_ok())
+            .join()
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn identity_lock_name_is_stable_per_key_and_hides_key_material() {
+        let key = [0xa5u8; 32];
+        let n1 = identity_lock_name(&key).expect("name");
+        let n2 = identity_lock_name(&key).expect("name");
+        assert_eq!(n1, n2);
+        assert!(n1.starts_with("Global\\wsecret-sshkey-"));
+        assert_eq!(n1.len(), "Global\\wsecret-sshkey-".len() + 64);
+        assert!(
+            n1["Global\\wsecret-sshkey-".len()..]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        );
+        // Keyed by the public key: one flipped bit gives a different name.
+        let mut other = key;
+        other[31] ^= 1;
+        assert_ne!(n1, identity_lock_name(&other).expect("name"));
+        // No key material in the object name: neither the raw public key nor
+        // its hex encoding appears in it (the name is a hash).
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!n1.contains(&hex));
+        assert!(!n1.as_bytes().windows(32).any(|w| w == key));
+    }
+
+    #[test]
+    fn identity_lock_busy_when_held_by_another_thread() {
+        let key = [0x5au8; 32];
+        let held = IdentityLock::acquire(&key).expect("first acquisition");
+        assert_eq!(held.outcome(), MutexOutcome::Acquired);
+        // Windows mutexes are owned per-thread, so the competing acquisition
+        // must happen on another thread: contention is `Error::Busy` there.
+        let failed =
+            std::thread::spawn(move || matches!(IdentityLock::acquire(&key), Err(Error::Busy)))
+                .join()
+                .unwrap();
+        assert!(failed, "contending acquisition must be Busy");
+        drop(held);
+        let ok = std::thread::spawn(move || IdentityLock::acquire(&key).is_ok())
             .join()
             .unwrap();
         assert!(ok);

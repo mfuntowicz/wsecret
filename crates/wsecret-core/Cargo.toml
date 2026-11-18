@@ -22,8 +22,13 @@ libhydrogen-sys = { path = "../libhydrogen-sys" }
 # - Win32_System_Console:      CONIN$/CONOUT$ passphrase prompting
 # - Win32_System_IO:           OVERLAPPED-based I/O on handles
 # - Win32_System_Memory:      VirtualLock/VirtualUnlock secret-memory locking
-# - Win32_System_Pipes:        PeekNamedPipe for the agent capability bridge
+# - Win32_System_Pipes:        PeekNamedPipe for the agent capability bridge;
+#   GetNamedPipeServerProcessId for the verified ssh-agent endpoint
+# - Win32_System_Services:     SCM query (ssh-agent service own-process type,
+#   state and PID) for the verified ssh-agent endpoint, src/windows/ssh_agent.rs
 # - Win32_System_Threading:    CreateThread / named-mutex primitives
+# - Win32_System_SystemInformation: GetSystemDirectoryW — the trusted
+#   bare-name roots for agent executable resolution
 # - Win32_Security_Cryptography: CryptProtectMemory/CryptUnprotectMemory
 #   (DPAPI key-at-rest encryption, session.rs / plan §5.3)
 # - Win32_System_ErrorReporting: Wer(Un)RegisterExcludedMemoryBlock
@@ -41,6 +46,8 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use wsecret_core::format::OPS_LIMIT_MIN;
-use wsecret_core::session::Session;
+use wsecret_core::session::{SecretBytes, Session};
 use wsecret_core::store::Store;
 
 /// Partition-A passphrase (fixture convention, plan §7.2).
@@ -95,8 +95,9 @@ pub fn slot_of(store: &mut Store, session: &Session, name: &[u8]) -> Option<u64>
     }
 }
 
-/// The decrypted value of `name`, if present.
-pub fn value_of(store: &mut Store, session: &Session, name: &[u8]) -> Option<Vec<u8>> {
+/// The decrypted value of `name` (zeroizing owner), if present. Borrow with
+/// `as_slice()` in assertions; the secret is erased on drop.
+pub fn value_of(store: &mut Store, session: &Session, name: &[u8]) -> Option<SecretBytes> {
     match store.find(session, name, false).expect("find") {
         wsecret_core::store::ScanOutcome::Found { value, .. } => Some(value),
         wsecret_core::store::ScanOutcome::NotFound { .. } => None,
@@ -192,7 +193,11 @@ pub fn probe_write(
         .args(&args)
         .output()
         .expect("spawn probe");
-    parse_probe(out.status.code().unwrap_or(-1) as u32, &out.stdout, &out.stderr)
+    parse_probe(
+        out.status.code().unwrap_or(-1) as u32,
+        &out.stdout,
+        &out.stderr,
+    )
 }
 
 fn parse_probe(code: u32, stdout: &[u8], stderr: &[u8]) -> ProbeRun {
@@ -269,11 +274,7 @@ pub fn keep_mutex_alive(store: &Path) -> MutexKeepAlive {
         .collect();
     // SAFETY: null security attributes + a valid name; the handle is checked.
     let handle = unsafe {
-        windows_sys::Win32::System::Threading::CreateMutexW(
-            std::ptr::null(),
-            0,
-            wide.as_ptr(),
-        )
+        windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, wide.as_ptr())
     };
     assert!(!handle.is_null(), "CreateMutexW for the keep-alive failed");
     MutexKeepAlive(handle)
@@ -326,12 +327,7 @@ pub fn upstream_available() -> bool {
 /// `Ok(bytes)` when the record exists; `Err(())` when upstream reports it
 /// missing (exit != 0).
 pub fn upstream_dump(store: &Path, name: &[u8], pass: &[u8]) -> Result<Vec<u8>, ()> {
-    let hex_out = upstream_run(&[
-        "dump",
-        &win_path(store),
-        &hex(name),
-        &hex(pass),
-    ])?;
+    let hex_out = upstream_run(&["dump", &win_path(store), &hex(name), &hex(pass)])?;
     let hex_out = hex_out.trim();
     Ok((0..hex_out.len())
         .step_by(2)
@@ -347,7 +343,13 @@ pub fn upstream_set(store: &Path, name: &[u8], pass: &[u8], value: &[u8]) -> i32
 
 /// `secret update NAME` (value on stdin) via the pinned upstream binary.
 pub fn upstream_update(store: &Path, name: &[u8], pass: &[u8], value: &[u8]) -> i32 {
-    upstream_run_code(&["update", &win_path(store), &hex(name), &hex(pass), &hex(value)])
+    upstream_run_code(&[
+        "update",
+        &win_path(store),
+        &hex(name),
+        &hex(pass),
+        &hex(value),
+    ])
 }
 
 fn win_path(p: &Path) -> String {
@@ -359,10 +361,16 @@ fn upstream_run(args: &[&str]) -> Result<String, ()> {
     let mut full = vec![
         String::from("--"),
         String::from("python3"),
-        format!("{}/crates/wsecret-core/tests/support/upstream_drv.py", driver_script()),
+        format!(
+            "{}/crates/wsecret-core/tests/support/upstream_drv.py",
+            driver_script()
+        ),
     ];
     full.extend(args.iter().map(|s| s.to_string()));
-    let out = Command::new("wsl.exe").args(&full).output().expect("spawn wsl.exe");
+    let out = Command::new("wsl.exe")
+        .args(&full)
+        .output()
+        .expect("spawn wsl.exe");
     if !out.status.success() {
         eprintln!(
             "upstream_drv {:?} failed ({})\nstdout: {}\nstderr: {}",
@@ -380,10 +388,16 @@ fn upstream_run_code(args: &[&str]) -> i32 {
     let mut full = vec![
         String::from("--"),
         String::from("python3"),
-        format!("{}/crates/wsecret-core/tests/support/upstream_drv.py", driver_script()),
+        format!(
+            "{}/crates/wsecret-core/tests/support/upstream_drv.py",
+            driver_script()
+        ),
     ];
     full.extend(args.iter().map(|s| s.to_string()));
-    let out = Command::new("wsl.exe").args(&full).output().expect("spawn wsl.exe");
+    let out = Command::new("wsl.exe")
+        .args(&full)
+        .output()
+        .expect("spawn wsl.exe");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !stderr.trim().is_empty() {
         eprintln!("upstream_drv stderr: {stderr}");

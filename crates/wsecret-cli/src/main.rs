@@ -42,11 +42,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use wsecret_cli::args::{self, Command, Dispatch, EXIT_FATAL, EXIT_OK, EXIT_USAGE};
-use wsecret_core::error::{CommitFailure, Error, FormatError, NameError};
+use wsecret_core::error::{CommitFailure, CommitState, Error, FormatError, NameError};
 use wsecret_core::format::{Header, NAME_MAX, VERSION};
 use wsecret_core::pass::{self, deterministic_pass};
 use wsecret_core::session::{SecretBytes, Session};
-use wsecret_core::store::{ScanOutcome, Store};
+use wsecret_core::store::{Limits, ScanMeta, ScanOutcome, Store};
 use wsecret_core::windows::agent_bridge::sessions_same_key;
 
 use crate::agent::AgentLaunchError;
@@ -158,6 +158,37 @@ fn msg_secret_not_found(key: &[u8]) -> Vec<u8> {
     m.extend_from_slice(key);
     m.extend_from_slice(b" not found");
     m
+}
+
+// ---- `ssh keygen` catalog (wsecret addition; no upstream string exists) ----
+//
+// These bodies carry the keygen commit state (plan §5.6 point 5) so the user
+// never acts on a wrong assumption about what was stored. Keep the status
+// and recovery instructions within `args::fatal_line`'s 248-byte body
+// budget, before the variable-length key name and diagnostic.
+
+/// `ssh keygen` after a CONFIRMED commit whose publication then failed: the
+/// private key IS stored and remains in the store. The body says so
+/// explicitly and never implies rerunning keygen (which would strand the
+/// stored key) or `dump` (which emits the private value).
+fn msg_keygen_stored_publication_failed(key: &[u8], detail: &[u8]) -> Vec<u8> {
+    let status: &[u8] =
+        b"ssh keygen: the private key is stored but the public line could not be printed. \
+        Do not rerun ssh keygen or use dump (dump emits the private value). \
+        To recover the public line, run ssh-add -L inside ssh agent KEY. KEY: ";
+    [status, key, b"; ", detail].concat()
+}
+
+/// `ssh keygen`'s store-write failure with `CommitState::Unknown`: the write
+/// may have landed. The unknown commit status is preserved verbatim — the
+/// key MAY be stored — and the guidance is reconciliation, never a blind
+/// keygen rerun (plan §5.6 point 5: "reconcile, do not blindly retry").
+fn msg_keygen_commit_unknown(key: &[u8], detail: &[u8]) -> Vec<u8> {
+    let status: &[u8] =
+        b"ssh keygen: commit status unknown: the private key may or may not be stored; \
+        the public key line was not printed. Do not blindly rerun ssh keygen; \
+        reopen the store and check for KEY: ";
+    [status, key, b"; ", detail].concat()
 }
 
 /// `s_fatal("Entry too big!")`.
@@ -294,6 +325,9 @@ fn error_outcome(error: &Error, path: &[u8]) -> Outcome {
         // Unreachable in dispatch (the confirmation gate runs here); mapped
         // to upstream's one ask-flow failure string so the mapping is total.
         Error::ConfirmationRequired => Outcome::fatal(msg_ask_pass_failed()),
+        // WS-06 cap rejection: the resource-limit diagnosis (limit exceeded,
+        // numerical bound, explicit remedy) IS the fatal message body.
+        Error::ResourceLimit(limit) => Outcome::fatal(limit.to_string().into_bytes()),
         // No upstream string exists for these internal failures; the
         // library's diagnostic is the honest fallback.
         other => Outcome::fatal(other.to_string().into_bytes()),
@@ -331,19 +365,25 @@ trait Platform {
     /// passphrase path.
     fn agent_acquire(&mut self, header: &Header) -> Option<Session>;
     /// Trusted-agent launch (`s_agent`), returning the child's exit code.
+    /// `limits` is the launcher's OWN store-open policy (WS-06): it governs
+    /// only the parent's open/unlock and is never injected into the child's
+    /// argv or environment.
     fn agent_launch(
         &mut self,
         store_path: &Path,
         cmd: &[&OsStr],
         pass_hex: bool,
+        limits: Limits,
     ) -> Result<i32, AgentLaunchError>;
-    /// Store-backed Ed25519 agent launch (`ssh agent KEY [CMD...]`).
+    /// Store-backed Ed25519 agent launch (`ssh agent KEY [CMD...]`);
+    /// `limits` as in [`Platform::agent_launch`].
     fn ssh_agent_launch(
         &mut self,
         store_path: &Path,
         key: &[u8],
         cmd: &[&OsStr],
         pass_hex: bool,
+        limits: Limits,
     ) -> Result<i32, SshAgentError>;
     /// Upstream `getenv(S_ENV_AGENT)` presence test used by `init`.
     fn agent_env_set(&self) -> bool;
@@ -386,12 +426,13 @@ impl Platform for RealPlatform {
         store_path: &Path,
         cmd: &[&OsStr],
         pass_hex: bool,
+        limits: Limits,
     ) -> Result<i32, AgentLaunchError> {
         let mut prompt = |p: &str| -> io::Result<Vec<u8>> {
             self.read_passphrase(p, pass_hex)
                 .map_err(|e| io::Error::other(e.to_string()))
         };
-        agent::launch(store_path, cmd, &mut prompt)
+        agent::launch(store_path, cmd, limits, &mut prompt)
     }
 
     fn ssh_agent_launch(
@@ -400,12 +441,13 @@ impl Platform for RealPlatform {
         key: &[u8],
         cmd: &[&OsStr],
         pass_hex: bool,
+        limits: Limits,
     ) -> Result<i32, SshAgentError> {
         let mut prompt = |p: &str| -> io::Result<Vec<u8>> {
             self.read_passphrase(p, pass_hex)
                 .map_err(|e| io::Error::other(e.to_string()))
         };
-        ssh_agent::launch(store_path, key, cmd, &mut prompt)
+        ssh_agent::launch(store_path, key, cmd, limits, &mut prompt)
     }
 
     fn agent_env_set(&self) -> bool {
@@ -421,17 +463,21 @@ struct Unlocked {
 }
 
 /// The command context: store path, platform, and the plan-§4 global modes.
-struct Ctx<P> {
+struct Ctx<'a, P> {
     store_path: PathBuf,
-    platform: P,
+    platform: &'a mut P,
     /// `--pass-hex`: raw-byte passphrase entry (plan §5.4, audit P5).
     pass_hex: bool,
+    /// Open policy for this invocation (WS-06): the ordinary `ops_limit`
+    /// ceiling unless the leading `--allow-expensive-kdf` explicitly lifted
+    /// it. Applied to every store open (commands, `agent`, `ssh agent`).
+    limits: Limits,
     /// `agent` command words as original `OsString`s (byte-exact argv for
     /// `CreateProcessW`; never round-tripped through UTF-8).
-    agent_cmd: Vec<OsString>,
+    agent_cmd: &'a [OsString],
 }
 
-impl<P: Platform> Ctx<P> {
+impl<P: Platform> Ctx<'_, P> {
     fn path_bytes(&self) -> Vec<u8> {
         self.store_path.as_os_str().as_encoded_bytes().to_vec()
     }
@@ -472,9 +518,9 @@ impl<P: Platform> Ctx<P> {
     /// upstream silent `s_exit(0)` ([`Outcome::Silent`]).
     fn open_session(&mut self, use_tty: bool, writable: bool) -> Result<Unlocked, Outcome> {
         let opened = if writable {
-            Store::open(&self.store_path)
+            Store::open_with_limits(&self.store_path, self.limits)
         } else {
-            Store::open_read(&self.store_path)
+            Store::open_read_with_limits(&self.store_path, self.limits)
         };
         let (store, header) = match opened {
             Ok(opened) => opened,
@@ -565,17 +611,16 @@ impl<P: Platform> Ctx<P> {
     }
 
     /// Writes the generated secret to stdout exactly as upstream
-    /// `s_normalize_and_show` does (raw characters, console newline), then
-    /// returns the buffer for the commit step — the print happens BEFORE the
-    /// write (plan audit P9 write-failure window, parity preserved).
+    /// `s_normalize_and_show` does (the characters, then the console newline
+    /// as its own `s_write`), borrowing the secret directly — zero copies —
+    /// then returns the buffer for the commit step: the print happens BEFORE
+    /// the write (plan audit P9 write-failure window, parity preserved).
     fn print_generated(&mut self, secret: &SecretBytes) -> Result<(), Outcome> {
-        let mut shown = secret.as_slice().to_vec();
+        self.write_stdout(secret.as_slice())?;
         if self.platform.stdout_is_console() {
-            shown.push(b'\n');
+            self.write_stdout(b"\n")?;
         }
-        let result = self.write_stdout(&shown);
-        libhydrogen_sys::memzero(&mut shown);
-        result
+        Ok(())
     }
 
     /// Shared `s_print_keys` body: one `name\n` per matching record, in
@@ -639,16 +684,34 @@ impl<P: Platform> Ctx<P> {
         };
         let (name, value) = found;
         let totp_name = !dump && contains(&name, b"totp");
-        let rendered = output::render_value(&value, dump, &name, self.platform.stdout_is_console());
+        // The render borrows the value (raw output, zero copies) or holds a
+        // zeroizing render owner (Base64/TOTP digits); either way the bytes
+        // are erased on drop, including error paths.
+        let rendered = match output::render_value(
+            value.as_slice(),
+            dump,
+            &name,
+            self.platform.stdout_is_console(),
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => return self.error(&error),
+        };
         if totp_name && rendered.is_empty() {
             // Upstream `s_show`: an empty TOTP struct is `Fatal: Invalid
             // secret`, printed before any stdout byte.
             return Outcome::fatal(msg_invalid_secret());
         }
-        match self.write_stdout(&rendered) {
-            Ok(()) => Outcome::Code(EXIT_OK),
-            Err(outcome) => outcome,
+        if let Err(outcome) = self.write_stdout(rendered.as_slice()) {
+            return outcome;
         }
+        // Upstream `s_show` writes the console newline as its own
+        // `s_write(1, "\n", 1)` after the value bytes.
+        if rendered.newline() {
+            if let Err(outcome) = self.write_stdout(b"\n") {
+                return outcome;
+            }
+        }
+        Outcome::Code(EXIT_OK)
     }
 
     /// `new KEY`: requires absence, generates and prints the secret, then
@@ -663,15 +726,17 @@ impl<P: Platform> Ctx<P> {
             Ok(store) => store,
             Err(error) => return self.error(&error),
         };
-        let (tombstone, decrypted_any) = match store.find(session, key, true) {
+        // Metadata-only existence probe: the record value is never
+        // materialized (plan §3.4 lookup contract).
+        let (tombstone, decrypted_any) = match store.find_meta(session, key, true) {
             Err(Error::Name(NameError::Exists)) => {
                 return Outcome::fatal(msg_secret_exists(key));
             }
             Err(e) => return self.error(&e),
-            Ok(ScanOutcome::Found { .. }) => {
+            Ok(ScanMeta::Found { .. }) => {
                 return Outcome::fatal(msg_secret_exists(key));
             }
-            Ok(ScanOutcome::NotFound {
+            Ok(ScanMeta::NotFound {
                 tombstone,
                 decrypted_any,
             }) => (tombstone, decrypted_any),
@@ -705,15 +770,17 @@ impl<P: Platform> Ctx<P> {
             Ok(store) => store,
             Err(error) => return self.error(&error),
         };
-        let (tombstone, decrypted_any) = match store.find(session, key, true) {
+        // Metadata-only existence probe: the record value is never
+        // materialized (plan §3.4 lookup contract).
+        let (tombstone, decrypted_any) = match store.find_meta(session, key, true) {
             Err(Error::Name(NameError::Exists)) => {
                 return Outcome::fatal(msg_secret_exists(key));
             }
             Err(e) => return self.error(&e),
-            Ok(ScanOutcome::Found { .. }) => {
+            Ok(ScanMeta::Found { .. }) => {
                 return Outcome::fatal(msg_secret_exists(key));
             }
-            Ok(ScanOutcome::NotFound {
+            Ok(ScanMeta::NotFound {
                 tombstone,
                 decrypted_any,
             }) => (tombstone, decrypted_any),
@@ -749,12 +816,14 @@ impl<P: Platform> Ctx<P> {
             Ok(store) => store,
             Err(error) => return self.error(&error),
         };
-        let slot = match store.find(session, key, false) {
+        // renew rewrites the slot in place and never reads the old value:
+        // metadata-only lookup (plan §3.4 lookup contract).
+        let slot = match store.find_meta(session, key, false) {
             Err(e) => return self.error(&e),
-            Ok(ScanOutcome::NotFound { .. }) => {
+            Ok(ScanMeta::NotFound { .. }) => {
                 return Outcome::fatal(msg_secret_not_found(key));
             }
-            Ok(ScanOutcome::Found { slot, .. }) => slot,
+            Ok(ScanMeta::Found { slot, .. }) => slot,
         };
         let candidate = match self.generate_candidate() {
             Ok(candidate) => candidate,
@@ -783,36 +852,51 @@ impl<P: Platform> Ctx<P> {
             Ok(store) => store,
             Err(error) => return self.error(&error),
         };
-        let (slot, mut old_value) = match store.find(session, key, false) {
-            Err(e) => return self.error(&e),
-            Ok(ScanOutcome::NotFound { .. }) => {
-                return Outcome::fatal(msg_secret_not_found(key));
+        // Bare `update KEY` never reads the old value: metadata-only lookup.
+        // The rename form keeps it on empty input, so only that form
+        // materializes it — once, into the zeroizing owner, and the kept
+        // bytes are written back by borrow (no `Vec` copy either way).
+        let (slot, old_value) = if new_key.is_none() {
+            match store.find_meta(session, key, false) {
+                Err(e) => return self.error(&e),
+                Ok(ScanMeta::NotFound { .. }) => {
+                    return Outcome::fatal(msg_secret_not_found(key));
+                }
+                Ok(ScanMeta::Found { slot, .. }) => (slot, None),
             }
-            Ok(ScanOutcome::Found { slot, value, .. }) => (slot, value),
+        } else {
+            match store.find(session, key, false) {
+                Err(e) => return self.error(&e),
+                Ok(ScanOutcome::NotFound { .. }) => {
+                    return Outcome::fatal(msg_secret_not_found(key));
+                }
+                Ok(ScanOutcome::Found { slot, value, .. }) => (slot, Some(value)),
+            }
         };
         let name = new_key.unwrap_or(key);
-        let mut value = match self.read_secret() {
-            Err(outcome) => {
-                libhydrogen_sys::memzero(&mut old_value);
-                return outcome;
-            }
-            Ok(Some(secret)) => secret.as_slice().to_vec(),
-            Ok(None) => match new_key {
-                // Rename form with empty input: keep the old value bytes.
-                Some(_) => std::mem::take(&mut old_value),
-                None => {
-                    libhydrogen_sys::memzero(&mut old_value);
-                    return Outcome::Silent;
+        let new_value = match self.read_secret() {
+            Err(outcome) => return outcome,
+            Ok(Some(secret)) => secret,
+            Ok(None) => match (new_key, old_value) {
+                // Rename form with empty input: keep the old value bytes,
+                // borrowed directly from the zeroizing owner.
+                (Some(_), Some(old_value)) => {
+                    return match store.write_slot(slot, session, name, old_value.as_slice()) {
+                        Ok(_) => Outcome::Code(EXIT_OK),
+                        Err(failure) => self.commit_error(&failure),
+                    };
                 }
+                // Bare `update KEY` with empty input: nothing to keep
+                // (and the unreachable rename-without-value pair fails
+                // silent-exit-0, never a write).
+                _ => return Outcome::Silent,
             },
         };
-        libhydrogen_sys::memzero(&mut old_value);
-        let outcome = match store.write_slot(slot, session, name, &value) {
+        // `new_value` (zeroizing owner) is erased on drop.
+        match store.write_slot(slot, session, name, new_value.as_slice()) {
             Ok(_) => Outcome::Code(EXIT_OK),
             Err(failure) => self.commit_error(&failure),
-        };
-        libhydrogen_sys::memzero(&mut value);
-        outcome
+        }
     }
 
     /// `pass KEY [SUBKEY...]`: unstored deterministic derivation over every
@@ -860,7 +944,7 @@ impl<P: Platform> Ctx<P> {
         let cmd: Vec<&OsStr> = self.agent_cmd.iter().map(OsString::as_os_str).collect();
         match self
             .platform
-            .agent_launch(&self.store_path, &cmd, self.pass_hex)
+            .agent_launch(&self.store_path, &cmd, self.pass_hex, self.limits)
         {
             Ok(code) => Outcome::Code(code as u32),
             Err(AgentLaunchError::Cancelled) => Outcome::Silent,
@@ -872,8 +956,13 @@ impl<P: Platform> Ctx<P> {
         }
     }
 
-    /// `ssh keygen KEY`: generate an Ed25519 keypair in memory, store the
-    /// 64-byte secret key, and print ONLY the OpenSSH public-key line.
+    /// `ssh keygen KEY`: generate an Ed25519 keypair in memory and commit the
+    /// 64-byte secret key BEFORE publishing anything, then print ONLY the
+    /// OpenSSH public-key line — and only on a confirmed commit (README:
+    /// "publishes the OpenSSH public-key line only after the vault write
+    /// commits"). Every failure up to and including the write publishes no
+    /// public bytes; a post-commit publication failure reports the committed
+    /// state explicitly and never implies rerunning keygen.
     fn run_ssh_keygen(&mut self, key: &[u8]) -> Outcome {
         let mut unlocked = match self.open_session(true, true) {
             Ok(unlocked) => unlocked,
@@ -884,15 +973,18 @@ impl<P: Platform> Ctx<P> {
             Ok(store) => store,
             Err(error) => return self.error(&error),
         };
-        let (tombstone, decrypted_any) = match store.find(session, key, true) {
+        // Metadata-only existence probe (the `find_meta` lookup contract,
+        // Plaintext's boundary): keygen needs the tombstone slot and
+        // `pass_ok` only — never record value bytes.
+        let (tombstone, decrypted_any) = match store.find_meta(session, key, true) {
             Err(Error::Name(NameError::Exists)) => {
                 return Outcome::fatal(msg_secret_exists(key));
             }
             Err(e) => return self.error(&e),
-            Ok(ScanOutcome::Found { .. }) => {
+            Ok(ScanMeta::Found { .. }) => {
                 return Outcome::fatal(msg_secret_exists(key));
             }
-            Ok(ScanOutcome::NotFound {
+            Ok(ScanMeta::NotFound {
                 tombstone,
                 decrypted_any,
             }) => (tombstone, decrypted_any),
@@ -911,12 +1003,43 @@ impl<P: Platform> Ctx<P> {
             Err(error) => return self.error(&error),
         };
         let line = ssh_agent::public_key_line(&public, key);
-        if let Err(outcome) = self.write_stdout(&line) {
-            return outcome;
+
+        // Commit the private key BEFORE any publication. `append_or_reuse`
+        // returns `Ok` only with a `Committed` receipt (plan §5.6 point 5) —
+        // that confirmation is what gates publishing below. Every failure
+        // path here leaves stdout untouched: no public bytes ever precede a
+        // confirmed commit.
+        if let Err(failure) = store.append_or_reuse(tombstone, session, key, secret.as_slice()) {
+            return self.keygen_commit_failed(&failure, key);
         }
-        match store.append_or_reuse(tombstone, session, key, secret.as_slice()) {
-            Ok(_) => Outcome::Code(EXIT_OK),
-            Err(failure) => self.commit_error(&failure),
+        if let Err(error) = self.platform.write_stdout(&line) {
+            // Committed-but-stdout-failed: the key IS stored and remains.
+            // The report says so explicitly and never implies rerunning
+            // keygen (which would strand this key) or `dump` (which emits
+            // the private value).
+            let detail = msg_strerror(b"stdout", &io_detail(&error));
+            return Outcome::fatal(msg_keygen_stored_publication_failed(key, &detail));
+        }
+        Outcome::Code(EXIT_OK)
+    }
+
+    /// `ssh keygen`'s store-write failure rendering: the plan §5.6 point 5
+    /// commit state is preserved at the CLI surface instead of being
+    /// collapsed by [`Ctx::commit_error`]. `Unknown` keeps the unknown
+    /// commit status visible (the key may be stored; reconcile, never a
+    /// blind keygen rerun); `NotCommitted` renders the catalog failure — the
+    /// store is provably unchanged and nothing was published.
+    fn keygen_commit_failed(&self, failure: &CommitFailure, key: &[u8]) -> Outcome {
+        let detail = failure.error.to_string().into_bytes();
+        match failure.state {
+            CommitState::Unknown => Outcome::fatal(msg_keygen_commit_unknown(key, &detail)),
+            CommitState::NotCommitted => self.error(&failure.error),
+            // Impossible: a committed mutation reports `Ok` with a receipt.
+            // Kept total and conservative — reported as stored so no wording
+            // can imply a safe keygen rerun.
+            CommitState::Committed => {
+                Outcome::fatal(msg_keygen_stored_publication_failed(key, &detail))
+            }
         }
     }
 
@@ -924,10 +1047,13 @@ impl<P: Platform> Ctx<P> {
     /// Windows agent, launch the trusted child, and remove it on clean exit.
     fn run_ssh_agent(&mut self, key: &[u8]) -> Outcome {
         let cmd: Vec<&OsStr> = self.agent_cmd.iter().map(OsString::as_os_str).collect();
-        match self
-            .platform
-            .ssh_agent_launch(&self.store_path, key, &cmd, self.pass_hex)
-        {
+        match self.platform.ssh_agent_launch(
+            &self.store_path,
+            key,
+            &cmd,
+            self.pass_hex,
+            self.limits,
+        ) {
             Ok(code) => Outcome::Code(code as u32),
             Err(SshAgentError::Cancelled) => Outcome::Silent,
             Err(SshAgentError::Core(e)) => self.error(&e),
@@ -948,9 +1074,18 @@ impl<P: Platform> Ctx<P> {
     }
 
     /// `init [opslimit N]`: exclusive creation of the 512-byte header block.
+    ///
+    /// WS-06: bounded consistently with opens — the same `Limits` policy
+    /// (ordinary `ops_limit` ceiling `OPS_LIMIT_MAX`; the explicit leading
+    /// `--allow-expensive-kdf` is the only override; the 10000 floor stays
+    /// enforced by option parsing and `Store::create`). A cap rejection
+    /// reports limit exceeded, the numerical bound and the explicit remedy.
     fn run_init(&mut self, ops_limit: u64) -> Outcome {
         if self.platform.agent_env_set() {
             return Outcome::fatal(msg_agent_running());
+        }
+        if let Err(error) = self.limits.check_opslimit(ops_limit) {
+            return self.error(&error);
         }
         match Store::create(&self.store_path, ops_limit) {
             Ok(_) => Outcome::Code(EXIT_OK),
@@ -985,21 +1120,16 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
         && hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Bridges [`args::Dispatch`] to [`Ctx`]: executes parsed commands and owns
-/// the fatal rendering/exit-code mapping.
-struct Dispatcher<P> {
-    ctx: Ctx<P>,
-}
-
-impl<P: Platform> Dispatch for Dispatcher<P> {
+/// Execute parsed commands and render the resulting exit status.
+impl<P: Platform> Dispatch for Ctx<'_, P> {
     fn execute(&mut self, command: Command<'_>) -> u32 {
-        let outcome = self.ctx.run(command);
-        self.ctx.finish(outcome)
+        let outcome = self.run(command);
+        self.finish(outcome)
     }
 
     fn complete_names(&mut self) -> u32 {
-        let outcome = self.ctx.run_complete_names();
-        self.ctx.finish(outcome)
+        let outcome = self.run_complete_names();
+        self.finish(outcome)
     }
 }
 
@@ -1009,23 +1139,44 @@ impl<P: Platform> Dispatch for Dispatcher<P> {
 
 /// `--keys-hex`/`--pass-hex` are wsecret additions (plan §4) and are stripped
 /// from argv before the argz-exact walk sees it.
+///
+/// `--allow-expensive-kdf` (WS-06) is stricter: honored ONLY in the global
+/// leading position — the flag run before the command word. It is never read
+/// from the environment and never from `agent`/`ssh agent` child command
+/// words (the parent must not derive it from child args, and the child argv
+/// is passed through verbatim). Outside the leading run the word stays in
+/// argv untouched: an ordinary operand for the argz walk, a literal child
+/// argument for `agent`/`ssh agent`. Duplicate leading occurrences are
+/// idempotent. It lifts only the `ops_limit` ceiling for THIS invocation;
+/// the 10000 floor still applies.
 struct Flags {
     keys_hex: bool,
     pass_hex: bool,
+    /// Explicit leading `--allow-expensive-kdf` (WS-06).
+    allow_expensive_kdf: bool,
 }
 
 fn strip_flags(mut raw: Vec<OsString>) -> (Vec<OsString>, Flags) {
     let mut flags = Flags {
         keys_hex: false,
         pass_hex: false,
+        allow_expensive_kdf: false,
     };
     let mut kept = Vec::with_capacity(raw.len());
+    // The global leading run ends at the first word that is not one of the
+    // global flags (i.e. the command word).
+    let mut leading = true;
     for (index, word) in raw.drain(..).enumerate() {
-        if index > 0 && word == "--keys-hex" {
+        if index == 0 {
+            kept.push(word);
+        } else if word == "--keys-hex" {
             flags.keys_hex = true;
-        } else if index > 0 && word == "--pass-hex" {
+        } else if word == "--pass-hex" {
             flags.pass_hex = true;
+        } else if leading && word == "--allow-expensive-kdf" {
+            flags.allow_expensive_kdf = true;
         } else {
+            leading = false;
             kept.push(word);
         }
     }
@@ -1142,19 +1293,14 @@ impl Write for StderrSink {
 
 /// Wires argv, the store path and the platform into [`args::run`] and
 /// returns the process exit code.
-fn run_main(raw: Vec<OsString>, mut platform: impl Platform) -> u32 {
+fn run_main(
+    raw: Vec<OsString>,
+    store_path: PathBuf,
+    platform: &mut impl Platform,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u32 {
     let (words, flags) = strip_flags(raw);
-    let store_path = match resolve_store_path(
-        std::env::var_os(ENV_STORE),
-        std::env::var_os(ENV_HOME),
-        std::env::var_os(ENV_USERPROFILE),
-    ) {
-        Ok(path) => path,
-        Err(body) => {
-            let _ = platform.write_stderr(&args::fatal_line(&body));
-            return EXIT_FATAL;
-        }
-    };
     let owned = match encode_argv(&words, flags.keys_hex) {
         Ok(owned) => owned,
         Err(body) => {
@@ -1166,31 +1312,33 @@ fn run_main(raw: Vec<OsString>, mut platform: impl Platform) -> u32 {
     // `agent` and `ssh agent` take their child command words as original
     // `OsString`s (byte-exact for `CreateProcessW`); everything else runs on
     // the encoded bytes. `ssh agent` additionally has a key operand to skip.
-    let agent_cmd = match words.get(1).map(|word| word.as_encoded_bytes()) {
-        Some(b"agent") => words[2..].to_vec(),
-        Some(b"ssh")
-            if words
-                .get(2)
-                .is_some_and(|sub| sub.as_encoded_bytes() == b"agent") =>
-        {
-            words[4..].to_vec()
-        }
-        _ => Vec::new(),
+    let agent_cmd = match words.as_slice() {
+        [_, cmd, child @ ..] if cmd == "agent" => child,
+        [_, cmd, sub, _, child @ ..] if cmd == "ssh" && sub == "agent" => child,
+        _ => &[],
     };
     let stdout_is_tty = platform.stdout_is_console();
-    let mut dispatcher = Dispatcher {
-        ctx: Ctx {
-            store_path,
-            platform,
-            pass_hex: flags.pass_hex,
-            agent_cmd,
-        },
+    // WS-06 open policy: ordinary opens cap the KDF `ops_limit` at
+    // `wsecret_core::store::OPS_LIMIT_MAX` (1_000_000). Only the explicit
+    // `--allow-expensive-kdf` in the global leading position lifts the
+    // ceiling — for this invocation only; never from the environment, never
+    // from `agent`/`ssh agent` child args. The 10000 floor still applies.
+    let limits = if flags.allow_expensive_kdf {
+        Limits::allow_expensive_kdf()
+    } else {
+        Limits::default()
     };
-    let (mut out, mut err) = (StdoutSink, StderrSink);
+    let mut dispatcher = Ctx {
+        store_path,
+        platform,
+        pass_hex: flags.pass_hex,
+        limits,
+        agent_cmd,
+    };
     let mut cli = args::Cli {
         stdout_is_tty,
-        stdout: &mut out,
-        stderr: &mut err,
+        stdout,
+        stderr,
     };
     args::run(&argv, &mut cli, &mut dispatcher)
 }
@@ -1206,7 +1354,23 @@ fn main() {
     // Upstream installs its no-op signal handlers before any work (plan §4
     // console-ctrl parity); setup failure is ignored like upstream's.
     let _ = console::install_console_ctrl_handler();
-    let code = run_main(std::env::args_os().collect(), RealPlatform);
+    let code = match resolve_store_path(
+        std::env::var_os(ENV_STORE),
+        std::env::var_os(ENV_HOME),
+        std::env::var_os(ENV_USERPROFILE),
+    ) {
+        Ok(path) => run_main(
+            std::env::args_os().collect(),
+            path,
+            &mut RealPlatform,
+            &mut StdoutSink,
+            &mut StderrSink,
+        ),
+        Err(body) => {
+            let _ = output::write_stderr(&args::fatal_line(&body));
+            EXIT_FATAL
+        }
+    };
     std::process::exit(code as i32);
 }
 
@@ -1278,9 +1442,16 @@ mod tests {
         agent_env: bool,
         launch: LaunchScript,
         stdout_tty: bool,
+        /// Injected [`Platform::write_stdout`] failure (publication-failure
+        /// tests): captures nothing and returns the injected error.
+        stdout_fail: bool,
         out: Vec<u8>,
         err: Vec<u8>,
         prompts: Vec<String>,
+        /// The `Limits` each launch call received (WS-06: proves the open
+        /// policy reaches `agent`/`ssh agent` and is never derived from
+        /// child args).
+        launch_limits: Vec<Limits>,
     }
 
     #[derive(Clone, Debug)]
@@ -1306,9 +1477,11 @@ mod tests {
                 agent_env: false,
                 launch: LaunchScript::Code(0),
                 stdout_tty: false,
+                stdout_fail: false,
                 out: Vec::new(),
                 err: Vec::new(),
                 prompts: Vec::new(),
+                launch_limits: Vec::new(),
             }
         }
 
@@ -1364,6 +1537,9 @@ mod tests {
         }
 
         fn write_stdout(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if self.stdout_fail {
+                return Err(io::Error::other("injected stdout failure"));
+            }
             self.out.extend_from_slice(bytes);
             Ok(())
         }
@@ -1386,7 +1562,9 @@ mod tests {
             _store_path: &Path,
             _cmd: &[&OsStr],
             _pass_hex: bool,
+            limits: Limits,
         ) -> Result<i32, AgentLaunchError> {
+            self.launch_limits.push(limits);
             match self.launch.clone() {
                 LaunchScript::Code(code) => Ok(code),
                 LaunchScript::AlreadyRunning => Err(AgentLaunchError::AlreadyRunning),
@@ -1408,7 +1586,9 @@ mod tests {
             _key: &[u8],
             _cmd: &[&OsStr],
             _pass_hex: bool,
+            limits: Limits,
         ) -> Result<i32, SshAgentError> {
+            self.launch_limits.push(limits);
             match self.launch.clone() {
                 LaunchScript::Code(code) => Ok(code),
                 LaunchScript::AlreadyRunning => Err(SshAgentError::AlreadyRunning),
@@ -1443,39 +1623,27 @@ mod tests {
         /// Parser-level errors (the `Option …` messages).
         parser_err: Vec<u8>,
         prompts: Vec<String>,
+        /// The `Limits` each `agent`/`ssh agent` launch received.
+        launch_limits: Vec<Limits>,
     }
 
-    fn dispatch(path: &Path, platform: FakePlatform, words: &[&[u8]]) -> Run {
-        let mut argv_owned: Vec<Vec<u8>> = vec![b"wsecret".to_vec()];
-        argv_owned.extend(words.iter().map(|w| w.to_vec()));
-        let argv: Vec<&[u8]> = argv_owned.iter().map(Vec::as_slice).collect();
-        let agent_cmd = if words.first() == Some(&b"agent".as_slice()) {
-            words[1..]
-                .iter()
-                .map(|w| OsString::from(String::from_utf8_lossy(w).into_owned()))
-                .collect()
-        } else {
-            Vec::new()
-        };
+    fn dispatch(path: &Path, mut platform: FakePlatform, words: &[&[u8]]) -> Run {
+        // Windows argv carries strings. Exercise the real --keys-hex path
+        // for arbitrary key bytes; never replace them with Unicode U+FFFD.
+        let mut raw = Vec::with_capacity(words.len() + 1);
+        raw.push(OsString::from("wsecret"));
+        raw.extend(words.iter().map(|word| {
+            OsString::from(std::str::from_utf8(word).expect("use --keys-hex for raw key bytes"))
+        }));
         let mut parser_out = Vec::new();
         let mut parser_err = Vec::new();
-        let mut dispatcher = Dispatcher {
-            ctx: Ctx {
-                store_path: path.to_path_buf(),
-                platform,
-                pass_hex: false,
-                agent_cmd,
-            },
-        };
-        let code = {
-            let mut cli = args::Cli {
-                stdout_is_tty: dispatcher.ctx.platform.stdout_tty,
-                stdout: &mut parser_out,
-                stderr: &mut parser_err,
-            };
-            args::run(&argv, &mut cli, &mut dispatcher)
-        };
-        let platform = dispatcher.ctx.platform;
+        let code = run_main(
+            raw,
+            path.to_path_buf(),
+            &mut platform,
+            &mut parser_out,
+            &mut parser_err,
+        );
         Run {
             code,
             out: platform.out,
@@ -1483,6 +1651,7 @@ mod tests {
             parser_out,
             parser_err,
             prompts: platform.prompts,
+            launch_limits: platform.launch_limits,
         }
     }
 
@@ -1530,7 +1699,7 @@ mod tests {
         let (mut store, header) = Store::open(&fx.path).expect("reopen store");
         let session = unlock_pw(&header);
         match store.find(&session, b"beta", false).expect("find beta") {
-            ScanOutcome::Found { value, .. } => assert_eq!(value, b"first"),
+            ScanOutcome::Found { value, .. } => assert_eq!(value.as_slice(), b"first"),
             other => panic!("beta missing: {other:?}"),
         }
         assert!(
@@ -1809,6 +1978,20 @@ mod tests {
         assert_eq!(run.parser_out, b"CMD\n");
     }
 
+    #[test]
+    fn ssh_agent_without_key_reports_usage_without_launching() {
+        let path = temp_path("ssh-agent-no-key");
+        let run = dispatch(&path, FakePlatform::tty(), &[b"ssh", b"agent"]);
+        assert_eq!(run.code, EXIT_USAGE);
+        assert_eq!(
+            run.parser_out,
+            b"Usage: ssh keygen KEY | ssh agent KEY [CMD [ARG...]]\n"
+        );
+        assert!(run.parser_err.is_empty() && run.err.is_empty());
+        assert!(run.out.is_empty() && run.prompts.is_empty());
+        assert!(run.launch_limits.is_empty());
+    }
+
     // ---- argz `Option %s …` messages (parser level) -------------------
 
     #[test]
@@ -1890,6 +2073,163 @@ mod tests {
         let bytes = std::fs::read(&path).expect("store written");
         let block: [u8; 512] = bytes.try_into().unwrap();
         assert_eq!(Header::parse(&block).unwrap().ops_limit, 25_000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- WS-06 open policy: ordinary opslimit ceiling and its explicit,
+    // position-restricted override -------------------------------------
+
+    /// The cap-rejection message body: limit exceeded, the numerical bound
+    /// and the explicit remedy (asserted exactly).
+    fn cap_body(actual: u64, limit: u64) -> Vec<u8> {
+        format!(
+            "Store opslimit {actual} exceeds the limit of {limit}; re-run with --allow-expensive-kdf before the command to allow expensive key derivation"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn above_limit_header_fatals_before_any_prompt_or_kdf() {
+        let max = wsecret_core::store::OPS_LIMIT_MAX;
+        let path = temp_path("cap-open");
+        let (store, _, _) = Store::create(&path, max + 1).expect("create above-limit header");
+        drop(store);
+
+        let run = dispatch(&path, FakePlatform::new(), &[b"list"]);
+        assert_eq!(run.code, EXIT_FATAL);
+        assert_eq!(run.err, fatal(&cap_body(max + 1, max)));
+        assert!(run.out.is_empty(), "no stdout on a cap fatal");
+        assert!(
+            run.prompts.is_empty(),
+            "the cap is checked before the passphrase prompt: {:?}",
+            run.prompts
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn init_is_bounded_consistently_with_the_open_policy() {
+        let max = wsecret_core::store::OPS_LIMIT_MAX;
+
+        // One above the ceiling: rejected with limit exceeded, the
+        // numerical bound and the explicit remedy; no store is created.
+        let over = temp_path("cap-init-over");
+        let run = dispatch(
+            &over,
+            FakePlatform::new(),
+            &[b"init", b"opslimit", b"1000001"],
+        );
+        assert_eq!(run.code, EXIT_FATAL);
+        assert_eq!(run.err, fatal(&cap_body(max + 1, max)));
+        assert!(!over.exists(), "no store may be created above the cap");
+
+        // The ceiling itself: accepted (boundary).
+        let at = temp_path("cap-init-at");
+        let run = dispatch(
+            &at,
+            FakePlatform::new(),
+            &[b"init", b"opslimit", b"1000000"],
+        );
+        assert_eq!(run.code, EXIT_OK);
+        let (store, header) = Store::open(&at).expect("ordinary open accepts the boundary");
+        assert_eq!(header.ops_limit, max);
+        drop(store);
+
+        // The explicit override creates the above-limit store — creation
+        // derives nothing, so this is cheap — and that store then needs the
+        // override to open: a consistent end-to-end story.
+        let expensive = temp_path("cap-init-override");
+        let run = dispatch(
+            &expensive,
+            FakePlatform::new(),
+            &[b"--allow-expensive-kdf", b"init", b"opslimit", b"2000000"],
+        );
+        assert_eq!(run.code, EXIT_OK);
+        let (store, header) = Store::open_with_limits(&expensive, Limits::allow_expensive_kdf())
+            .expect("explicit override opens the expensive store");
+        assert_eq!(header.ops_limit, 2_000_000);
+        drop(store);
+        let run = dispatch(&expensive, FakePlatform::new(), &[b"list"]);
+        assert_eq!(run.code, EXIT_FATAL);
+        assert_eq!(run.err, fatal(&cap_body(2_000_000, max)));
+
+        // "normal minimum still applies": the override lifts only the
+        // ceiling — option parsing still rejects below-floor values.
+        let floor = temp_path("cap-init-floor");
+        let run = dispatch(
+            &floor,
+            FakePlatform::new(),
+            &[b"--allow-expensive-kdf", b"init", b"opslimit", b"9999"],
+        );
+        assert_eq!(run.code, EXIT_USAGE);
+        assert_eq!(
+            run.parser_err,
+            b"Option opslimit must be a number greater than or equal to 10000\n"
+        );
+        assert!(!floor.exists());
+
+        for p in [&over, &at, &expensive, &floor] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn leading_override_lifts_the_cap_without_expensive_computation() {
+        let max = wsecret_core::store::OPS_LIMIT_MAX;
+        let path = temp_path("cap-override");
+        let (store, _, _) = Store::create(&path, max + 1).expect("create above-limit header");
+        drop(store);
+
+        // Empty passphrase: the run reaches the prompt (the cap is lifted)
+        // and exits through upstream's empty-input `s_exit(0)` BEFORE any
+        // KDF — the acceptance check derives nothing.
+        let platform = FakePlatform {
+            passphrase: Vec::new(),
+            ..FakePlatform::new()
+        };
+        let run = dispatch(&path, platform, &[b"--allow-expensive-kdf", b"list"]);
+        assert_eq!(run.code, EXIT_OK);
+        assert_eq!(
+            run.prompts,
+            vec![PROMPT_PASSPHRASE.to_owned()],
+            "the override must reach the prompt"
+        );
+        assert!(run.err.is_empty());
+        assert!(run.out.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn override_is_not_inherited_from_trailing_position_or_child_args() {
+        let max = wsecret_core::store::OPS_LIMIT_MAX;
+        let path = temp_path("cap-no-inherit");
+        let (store, _, _) = Store::create(&path, max + 1).expect("create above-limit header");
+        drop(store);
+
+        // Trailing position: the word is an ordinary operand — the cap
+        // rejection stands and nothing is prompted.
+        let platform = FakePlatform {
+            passphrase: Vec::new(),
+            ..FakePlatform::new()
+        };
+        let run = dispatch(&path, platform, &[b"list", b"--allow-expensive-kdf"]);
+        assert_eq!(run.code, EXIT_FATAL);
+        assert_eq!(run.err, fatal(&cap_body(max + 1, max)));
+        assert!(run.prompts.is_empty(), "cap first: {:?}", run.prompts);
+
+        // `agent` child args: the word is passed through to the child
+        // verbatim and the parent keeps the ordinary policy.
+        let run = dispatch(
+            &path,
+            FakePlatform::new(),
+            &[b"agent", b"--allow-expensive-kdf", b"cmd"],
+        );
+        assert_eq!(run.code, EXIT_OK, "scripted child exit");
+        assert_eq!(
+            run.launch_limits,
+            vec![Limits::default()],
+            "child args must never lift the parent's cap"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2147,9 +2487,37 @@ mod tests {
         let fx = Fixture::new("show-missing", &[(b"alpha", b"1")]);
         // Valid key rule (upstream `s_keylen`): no empty keys and no bytes
         // `<= 0x20`; raw high bytes are legal and echoed verbatim.
-        let run = dispatch(&fx.path, FakePlatform::new(), &[b"show", b"\x80miss"]);
-        assert_eq!(run.code, EXIT_FATAL);
-        assert_eq!(run.err, fatal(b"Secret \x80miss not found"));
+        let miss = b"806d697373"; // \x80miss via Windows argv
+        let cases: &[&[&[u8]]] = &[
+            &[b"--keys-hex", b"show", miss],
+            &[b"--keys-hex", b"dump", miss],
+            &[b"--keys-hex", b"renew", miss],
+            &[b"--keys-hex", b"update", miss],
+            &[b"--keys-hex", b"update", miss, b"6e6577"],
+        ];
+        for words in cases {
+            let run = dispatch(&fx.path, FakePlatform::new(), words);
+            assert_eq!(run.code, EXIT_FATAL, "{words:?}");
+            assert_eq!(run.err, fatal(b"Secret \x80miss not found"), "{words:?}");
+            assert!(run.out.is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_key_fatals_exists_with_the_key_bytes() {
+        let fx = Fixture::new("raw-exists", &[(b"\x80hit", b"1")]);
+        let hit = b"80686974";
+        let cases: &[&[&[u8]]] = &[
+            &[b"--keys-hex", b"new", hit],
+            &[b"--keys-hex", b"set", hit],
+            &[b"--keys-hex", b"ssh", b"keygen", hit],
+        ];
+        for words in cases {
+            let run = dispatch(&fx.path, FakePlatform::new(), words);
+            assert_eq!(run.code, EXIT_FATAL, "{words:?}");
+            assert_eq!(run.err, fatal(b"Secret \x80hit exists!"), "{words:?}");
+            assert!(run.out.is_empty());
+        }
     }
 
     #[test]
@@ -2456,6 +2824,193 @@ mod tests {
         assert_eq!(run.err, fatal(&msg_store_missing(path_bytes)));
     }
 
+    // ---- ssh keygen --------------------------------------------------
+
+    /// Success roundtrip: the 64-byte secret key is committed first, then
+    /// the OpenSSH public line is published — and the published line is
+    /// exactly the public half of the stored key. The commit-before-publish
+    /// ORDER is pinned by the failure tests below: an output failure can
+    /// only leave a stored key behind if the commit ran before publication.
+    #[test]
+    fn ssh_keygen_commits_the_key_then_publishes_the_public_line() {
+        let fx = Fixture::new("keygen-ok", &[(b"keep", b"v")]);
+        let run = dispatch(
+            &fx.path,
+            FakePlatform::new(),
+            &[b"ssh", b"keygen", b"test/ssh"],
+        );
+        assert_eq!(run.code, EXIT_OK);
+        assert!(run.err.is_empty());
+        assert!(run.out.starts_with(b"ssh-ed25519 "));
+        assert!(run.out.ends_with(b" wsecret:test/ssh\n"));
+        assert_eq!(run.out.iter().filter(|&&b| b == b'\n').count(), 1);
+
+        let (mut store, header) = Store::open(&fx.path).unwrap();
+        let session = unlock_pw(&header);
+        let value = match store.find(&session, b"test/ssh", false).unwrap() {
+            ScanOutcome::Found { value, .. } => value,
+            other => panic!("key not stored: {other:?}"),
+        };
+        assert_eq!(value.len(), 64);
+        // The line is the OpenSSH encoding of the stored public half.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&11u32.to_be_bytes());
+        blob.extend_from_slice(b"ssh-ed25519");
+        blob.extend_from_slice(&32u32.to_be_bytes());
+        blob.extend_from_slice(&value.as_slice()[32..]);
+        let mut expected = b"ssh-ed25519 ".to_vec();
+        expected.extend_from_slice(&output::base64_encode(&blob));
+        expected.extend_from_slice(b" wsecret:test/ssh\n");
+        assert_eq!(run.out, expected, "published line = stored public half");
+        assert!(
+            !run.out.windows(32).any(|w| w == &value.as_slice()[..32]),
+            "private scalar must never be printed"
+        );
+    }
+
+    /// Injected store failure at the COMMIT step (a trailing partial block
+    /// makes the append target a non-record offset — spec §3.5 shape rules,
+    /// a pre-write `NotCommitted` rejection): nothing may be published
+    /// without a confirmed commit, and the store is left unchanged.
+    #[test]
+    fn ssh_keygen_injected_store_failure_publishes_no_public_bytes() {
+        let fx = Fixture::new("keygen-store-fail", &[(b"keep", b"v")]);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fx.path)
+            .unwrap();
+        file.write_all(&[0xA5; 100]).unwrap();
+        drop(file);
+        let size_before = std::fs::metadata(&fx.path).unwrap().len();
+
+        let run = dispatch(&fx.path, FakePlatform::new(), &[b"ssh", b"keygen", b"k"]);
+        assert_eq!(run.code, EXIT_FATAL);
+        assert!(
+            run.out.is_empty(),
+            "no public bytes may precede a confirmed commit"
+        );
+        let path_bytes = fx.path.as_os_str().as_encoded_bytes();
+        assert_eq!(run.err, fatal(&msg_unable_to_read(path_bytes)));
+        assert_eq!(
+            std::fs::metadata(&fx.path).unwrap().len(),
+            size_before,
+            "pre-write rejection: the store is unchanged"
+        );
+    }
+
+    /// Output failure AFTER a confirmed commit: the private key remains in
+    /// the store and the report is the explicit committed-but-unpublished
+    /// message — actionable, and never implying a keygen rerun (or `dump`,
+    /// which would emit the private value).
+    #[test]
+    fn ssh_keygen_output_failure_keeps_the_stored_key_and_reports_the_commit() {
+        let fx = Fixture::new("keygen-out-fail", &[(b"keep", b"v")]);
+        let platform = FakePlatform {
+            stdout_fail: true,
+            ..FakePlatform::new()
+        };
+        let run = dispatch(&fx.path, platform, &[b"ssh", b"keygen", b"k"]);
+        assert_eq!(run.code, EXIT_FATAL);
+        assert!(
+            run.out.is_empty(),
+            "publication failed: nothing was printed"
+        );
+        let detail = msg_strerror(b"stdout", b"injected stdout failure");
+        assert_eq!(
+            run.err,
+            fatal(&msg_keygen_stored_publication_failed(b"k", &detail))
+        );
+        // "Never imply retry keygen": the report forbids it and never
+        // phrases the failure as transient.
+        assert!(contains(&run.err, b"the private key is stored"));
+        assert!(contains(&run.err, b"Do not rerun ssh keygen"));
+        assert!(!contains(&run.err, b"try again"));
+        assert!(!contains(&run.err, b"retry"));
+
+        // The committed key remains: a 64-byte Ed25519 secret under `k`.
+        let (mut store, header) = Store::open(&fx.path).unwrap();
+        let session = unlock_pw(&header);
+        match store.find(&session, b"k", false).unwrap() {
+            ScanOutcome::Found { value, .. } => assert_eq!(value.len(), 64),
+            other => panic!("stored key must remain: {other:?}"),
+        }
+    }
+
+    /// Unknown commit status preservation (plan §5.6 point 5): a write that
+    /// failed after initiation is reported as UNKNOWN — the key may be
+    /// stored — with reconciliation guidance and no implied keygen retry;
+    /// a pre-write failure keeps the plain catalog rendering. The store
+    /// cannot surface `Unknown` deterministically in-process (the §5.6 seams
+    /// are process-global one-shots that parallel fixture writes would
+    /// steal), so the state→report mapping is pinned directly.
+    #[test]
+    fn ssh_keygen_unknown_commit_status_is_preserved_and_never_implies_retry() {
+        let ctx = Ctx {
+            store_path: temp_path("keygen-state"),
+            platform: &mut FakePlatform::new(),
+            pass_hex: false,
+            limits: Limits::default(),
+            agent_cmd: &[],
+        };
+        let unknown =
+            CommitFailure::unknown(Error::Io(io::Error::other("injected mid-write failure")));
+        let body = match ctx.keygen_commit_failed(&unknown, b"k") {
+            Outcome::Fatal(body) => body,
+            Outcome::Code(code) => panic!("expected a fatal, got exit code {code}"),
+            Outcome::Silent => panic!("expected a fatal, got the silent exit"),
+        };
+        assert_eq!(
+            body,
+            msg_keygen_commit_unknown(b"k", b"i/o error: injected mid-write failure")
+        );
+        assert!(contains(&body, b"commit status unknown"));
+        assert!(contains(&body, b"may or may not be stored"));
+        assert!(contains(&body, b"the public key line was not printed"));
+        assert!(!contains(&body, b"try again"));
+        assert!(!contains(&body, b"retry"));
+
+        // `NotCommitted` (provably unchanged): the catalog failure, with no
+        // key-state claim.
+        let before =
+            CommitFailure::before_write(Error::Io(io::Error::other("injected pre-write failure")));
+        match ctx.keygen_commit_failed(&before, b"k") {
+            Outcome::Fatal(body) => {
+                let path_bytes = ctx.path_bytes();
+                assert_eq!(
+                    body,
+                    msg_strerror(&path_bytes, b"injected pre-write failure")
+                );
+                assert!(!contains(&body, b"stored"));
+                assert!(!contains(&body, b"unknown"));
+            }
+            Outcome::Code(code) => panic!("expected a fatal, got exit code {code}"),
+            Outcome::Silent => panic!("expected a fatal, got the silent exit"),
+        }
+    }
+
+    #[test]
+    fn bounded_keygen_fatals_keep_commit_status_and_recovery_instructions() {
+        let key = [b'k'; NAME_MAX];
+        let detail = [b'x'; 256];
+        let stored = fatal(&msg_keygen_stored_publication_failed(&key, &detail));
+        assert!(stored.starts_with(b"Fatal: ssh keygen: the private key is stored"));
+        assert!(contains(&stored, b"public line could not be printed"));
+        assert!(contains(&stored, b"Do not rerun ssh keygen or use dump"));
+        assert!(contains(&stored, b"ssh-add -L inside ssh agent KEY"));
+
+        let unknown = fatal(&msg_keygen_commit_unknown(&key, &detail));
+        assert!(unknown.starts_with(b"Fatal: ssh keygen: commit status unknown"));
+        assert!(contains(&unknown, b"may or may not be stored"));
+        assert!(contains(&unknown, b"the public key line was not printed"));
+        assert!(contains(&unknown, b"Do not blindly rerun ssh keygen"));
+        assert!(contains(&unknown, b"reopen the store and check for KEY"));
+
+        for line in [stored, unknown] {
+            assert_eq!(line.len(), 256);
+            assert!(line.ends_with(b"\n"));
+        }
+    }
+
     // ---- global modes (plan §4 additions) -----------------------------
 
     #[test]
@@ -2524,6 +3079,88 @@ mod tests {
         assert_eq!(words.len(), 3);
         assert_eq!(words[1].as_encoded_bytes(), b"set");
         assert_eq!(words[2].as_encoded_bytes(), b"k");
+    }
+
+    #[test]
+    fn allow_expensive_kdf_is_honored_only_in_the_global_leading_position() {
+        // Honored in the leading run (before the command word); duplicate
+        // occurrences are idempotent; `--keys-hex` still strips anywhere and
+        // does not end the leading run.
+        let (words, flags) = strip_flags(vec![
+            OsString::from("wsecret"),
+            OsString::from("--allow-expensive-kdf"),
+            OsString::from("--keys-hex"),
+            OsString::from("--allow-expensive-kdf"),
+            OsString::from("init"),
+            OsString::from("opslimit"),
+            OsString::from("2000000"),
+        ]);
+        assert!(flags.allow_expensive_kdf, "leading flag must be honored");
+        assert!(flags.keys_hex);
+        assert_eq!(words, ["wsecret", "init", "opslimit", "2000000"]);
+
+        // After the command word: NOT honored and NOT stripped — it stays
+        // an ordinary operand for the argz walk.
+        let (words, flags) = strip_flags(vec![
+            OsString::from("wsecret"),
+            OsString::from("show"),
+            OsString::from("--allow-expensive-kdf"),
+            OsString::from("key"),
+        ]);
+        assert!(!flags.allow_expensive_kdf, "trailing flag must not count");
+        assert_eq!(words, ["wsecret", "show", "--allow-expensive-kdf", "key"]);
+
+        // A stripped-anywhere mode after the command does NOT extend the
+        // leading run for `--allow-expensive-kdf`.
+        let (words, flags) = strip_flags(vec![
+            OsString::from("wsecret"),
+            OsString::from("show"),
+            OsString::from("--keys-hex"),
+            OsString::from("--allow-expensive-kdf"),
+        ]);
+        assert!(flags.keys_hex);
+        assert!(
+            !flags.allow_expensive_kdf,
+            "the leading run ended at the command word"
+        );
+        assert_eq!(words, ["wsecret", "show", "--allow-expensive-kdf"]);
+
+        // `agent` child args are passed through verbatim: the parent never
+        // derives the override from them (and never injects one).
+        let (words, flags) = strip_flags(vec![
+            OsString::from("wsecret"),
+            OsString::from("agent"),
+            OsString::from("wsecret"),
+            OsString::from("--allow-expensive-kdf"),
+            OsString::from("show"),
+            OsString::from("x"),
+        ]);
+        assert!(
+            !flags.allow_expensive_kdf,
+            "child args must not be inherited"
+        );
+        assert_eq!(
+            words,
+            [
+                "wsecret",
+                "agent",
+                "wsecret",
+                "--allow-expensive-kdf",
+                "show",
+                "x"
+            ]
+        );
+
+        // No environment source exists for the override: `strip_flags` is
+        // its only recognizer and it reads argv alone (regression guard
+        // against a future implicit `WSSECRET_*`-style inheritance).
+        let (words, flags) = strip_flags(vec![
+            OsString::from("wsecret"),
+            OsString::from("WSSECRET_ALLOW_EXPENSIVE_KDF=1"),
+            OsString::from("list"),
+        ]);
+        assert!(!flags.allow_expensive_kdf, "env words are ordinary words");
+        assert_eq!(words, ["wsecret", "WSSECRET_ALLOW_EXPENSIVE_KDF=1", "list"]);
     }
 
     // ---- Deterministic `pass` equality vs an independent oracle ----

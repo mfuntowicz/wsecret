@@ -25,7 +25,7 @@
 //! | `Name(EntryTooBig)` | `ENTRY_TOO_BIG` (3) |
 //! | `Cancelled` | `CANCELLED` (16) |
 //! | `Agent(_)` | `AGENT_UNAVAILABLE` (22) |
-//! | `ResourceLimit` | `RESOURCE_LIMIT` (8) |
+//! | `ResourceLimit(_)` | `RESOURCE_LIMIT` (8) |
 //! | `MemoryProtection` | `MEMORY_PROTECTION` (20) |
 //! | `ConfirmationRequired` | `CONFIRMATION_REQUIRED` (11) |
 //! | `PassphraseMismatch` | `PASSPHRASE_MISMATCH` (12) |
@@ -257,6 +257,73 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// Which configured bound a [`LimitExceeded`] diagnoses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitKind {
+    /// The store header's KDF `ops_limit` (work factor) is above the
+    /// caller's ceiling ([`crate::store::Limits::max_opslimit`]).
+    OpsLimit,
+    /// The store file size is above the caller's ceiling
+    /// ([`crate::store::Limits::max_store_bytes`]).
+    StoreBytes,
+}
+
+/// The explicit remedy for an exceeded limit (WS-06: a cap rejection must
+/// tell the user that a limit was exceeded, the numerical bound, and exactly
+/// what to do about it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitRemedy {
+    /// Re-run with the global `--allow-expensive-kdf` option, in the leading
+    /// position before the command word. It lifts only the `ops_limit`
+    /// ceiling: the [`crate::format::OPS_LIMIT_MIN`] floor still applies.
+    AllowExpensiveKdf,
+    /// No user override exists: the calling application configured the bound.
+    CallerConfigured,
+}
+
+/// Diagnosis carried by [`Error::ResourceLimit`]: which limit was exceeded,
+/// the offending value, the numerical bound, and the explicit remedy. The
+/// [`fmt::Display`] is the complete user-facing message body (the CLI adds
+/// its `Fatal: ` prefix; the library never prints).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitExceeded {
+    /// Which bound was exceeded.
+    pub kind: LimitKind,
+    /// The offending value found (header `ops_limit`, store size in bytes).
+    pub actual: u64,
+    /// The configured numerical bound.
+    pub limit: u64,
+    /// What the user can do about it.
+    pub remedy: LimitRemedy,
+}
+
+impl fmt::Display for LimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            LimitKind::OpsLimit => write!(
+                f,
+                "Store opslimit {} exceeds the limit of {}",
+                self.actual, self.limit
+            )?,
+            LimitKind::StoreBytes => write!(
+                f,
+                "Store size {} exceeds the limit of {} bytes",
+                self.actual, self.limit
+            )?,
+        }
+        match self.remedy {
+            LimitRemedy::AllowExpensiveKdf => f.write_str(
+                "; re-run with --allow-expensive-kdf before the command to allow expensive key derivation",
+            ),
+            LimitRemedy::CallerConfigured => {
+                f.write_str("; the limit is configured by the calling application")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LimitExceeded {}
+
 /// The one error enum shared by the Rust API and the future C ABI (plan §3.4).
 #[derive(Debug)]
 pub enum Error {
@@ -271,8 +338,10 @@ pub enum Error {
     Cancelled,
     /// Trusted-agent failure (see [`AgentError`]).
     Agent(AgentError),
-    /// A configured resource limit was exceeded.
-    ResourceLimit,
+    /// A configured resource limit was exceeded ([`LimitExceeded`] carries
+    /// the diagnosis: which limit, the offending value, the numerical bound
+    /// and the explicit remedy).
+    ResourceLimit(LimitExceeded),
     /// Secret-memory protection (locking/zeroization) failed.
     MemoryProtection,
     /// The operation requires user confirmation before proceeding.
@@ -316,7 +385,7 @@ impl Error {
             Error::Name(name) => name.status(),
             Error::Cancelled => Status::Cancelled,
             Error::Agent(_) => Status::AgentUnavailable,
-            Error::ResourceLimit => Status::ResourceLimit,
+            Error::ResourceLimit(_) => Status::ResourceLimit,
             Error::MemoryProtection => Status::MemoryProtection,
             Error::ConfirmationRequired => Status::ConfirmationRequired,
             Error::PassphraseMismatch => Status::PassphraseMismatch,
@@ -363,7 +432,9 @@ impl fmt::Display for Error {
             Error::Name(name) => write!(f, "name error: {name}"),
             Error::Cancelled => f.write_str("operation cancelled"),
             Error::Agent(agent) => write!(f, "agent error: {agent}"),
-            Error::ResourceLimit => f.write_str("resource limit exceeded"),
+            // The diagnosis IS the message: which limit, the offending
+            // value, the numerical bound and the explicit remedy.
+            Error::ResourceLimit(limit) => write!(f, "{limit}"),
             Error::MemoryProtection => f.write_str("memory protection failure"),
             Error::ConfirmationRequired => f.write_str("confirmation required"),
             Error::PassphraseMismatch => f.write_str("passphrases don't match"),
@@ -478,10 +549,7 @@ pub struct CommitReceipt {
 impl CommitReceipt {
     /// A receipt for a mutation with no post-commit anomalies.
     pub const fn new(state: CommitState) -> Self {
-        CommitReceipt {
-            state,
-            warnings: 0,
-        }
+        CommitReceipt { state, warnings: 0 }
     }
 
     /// Records a post-commit warning bit.
@@ -637,6 +705,38 @@ mod tests {
     }
 
     #[test]
+    fn resource_limit_diagnosis_names_limit_bound_and_remedy() {
+        let ops = Error::ResourceLimit(LimitExceeded {
+            kind: LimitKind::OpsLimit,
+            actual: 1_000_001,
+            limit: 1_000_000,
+            remedy: LimitRemedy::AllowExpensiveKdf,
+        });
+        assert_eq!(ops.status(), Status::ResourceLimit);
+        assert_eq!(
+            ops.to_string(),
+            "Store opslimit 1000001 exceeds the limit of 1000000; re-run with \
+             --allow-expensive-kdf before the command to allow expensive key derivation"
+        );
+        // The remedy is part of the diagnosis: the message must name the
+        // explicit override.
+        assert!(ops.to_string().contains("--allow-expensive-kdf"));
+
+        let bytes = Error::ResourceLimit(LimitExceeded {
+            kind: LimitKind::StoreBytes,
+            actual: 4096,
+            limit: 512,
+            remedy: LimitRemedy::CallerConfigured,
+        });
+        assert_eq!(bytes.status(), Status::ResourceLimit);
+        assert_eq!(
+            bytes.to_string(),
+            "Store size 4096 exceeds the limit of 512 bytes; the limit is \
+             configured by the calling application"
+        );
+    }
+
+    #[test]
     fn commit_receipt_warning_bits() {
         let receipt = CommitReceipt::new(CommitState::Committed)
             .with_warning(WARN_POST_COMMIT_PANIC)
@@ -656,7 +756,8 @@ mod tests {
         let f = CommitFailure::unknown(Error::Cancelled);
         assert_eq!(f.state, CommitState::Unknown);
         assert_eq!(f.status(), Status::Cancelled);
-        let outcome: CommitOutcome<()> = Err(CommitFailure::new(Error::Locked, CommitState::Unknown));
+        let outcome: CommitOutcome<()> =
+            Err(CommitFailure::new(Error::Locked, CommitState::Unknown));
         assert!(outcome.is_err());
     }
 }

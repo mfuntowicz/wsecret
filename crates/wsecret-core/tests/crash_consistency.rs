@@ -42,7 +42,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use support::{
-    file_hash, file_len, probe_write, temp_dir, unlock, upstream_dump, value_of, PASS_A,
+    PASS_A, file_hash, file_len, probe_write, temp_dir, unlock, upstream_dump, value_of,
 };
 use wsecret_core::error::{Status, WARN_ABANDONED_MUTEX};
 use wsecret_core::format::OPS_LIMIT_MIN;
@@ -124,7 +124,11 @@ fn e4_short_write_overwrite_tears_only_the_target_slot() {
         PASS_A,
         KEEP.0,
         b"KEEP-NEW\n",
-        &[String::from("fault"), String::from("mid"), String::from("short")],
+        &[
+            String::from("fault"),
+            String::from("mid"),
+            String::from("short"),
+        ],
     );
     assert_eq!(run.code, 2, "short write must fail the mutation: {run:?}");
     assert_eq!(run.status, STATUS_IO, "{run:?}");
@@ -132,15 +136,25 @@ fn e4_short_write_overwrite_tears_only_the_target_slot() {
 
     // Overwrite class: length unchanged and 512-aligned (§5.6 point 4).
     assert_eq!(file_len(&path), SEED_LEN);
-    assert_ne!(file_hash(&path), before, "the target slot was partially written");
+    assert_ne!(
+        file_hash(&path),
+        before,
+        "the target slot was partially written"
+    );
 
     let (mut store, session) = unlock(&path, PASS_A);
     assert!(
         value_of(&mut store, &session, KEEP.0).is_none(),
         "the torn record is skipped by scans"
     );
-    assert_eq!(value_of(&mut store, &session, OTHER.0).unwrap(), OTHER.1);
-    assert_eq!(value_of(&mut store, &session, THIRD.0).unwrap(), THIRD.1);
+    assert_eq!(
+        value_of(&mut store, &session, OTHER.0).unwrap().as_slice(),
+        OTHER.1
+    );
+    assert_eq!(
+        value_of(&mut store, &session, THIRD.0).unwrap().as_slice(),
+        THIRD.1
+    );
     drop(store);
     drop(session);
 
@@ -148,7 +162,10 @@ fn e4_short_write_overwrite_tears_only_the_target_slot() {
     // slot reported not-found (its scan skips it too).
     assert_eq!(upstream_dump(&path, OTHER.0, PASS_A).unwrap(), OTHER.1);
     assert_eq!(upstream_dump(&path, THIRD.0, PASS_A).unwrap(), THIRD.1);
-    assert!(upstream_dump(&path, KEEP.0, PASS_A).is_err(), "torn record is gone upstream too");
+    assert!(
+        upstream_dump(&path, KEEP.0, PASS_A).is_err(),
+        "torn record is gone upstream too"
+    );
 
     assert_no_stray_files(&dir, "store.secret");
 }
@@ -166,7 +183,11 @@ fn e4_short_write_append_leaves_a_tolerated_suffix() {
         PASS_A,
         b"new",
         b"NEW-VAL\n",
-        &[String::from("fault"), String::from("mid"), String::from("short")],
+        &[
+            String::from("fault"),
+            String::from("mid"),
+            String::from("short"),
+        ],
     );
     assert_eq!(run.code, 2, "short write must fail the mutation: {run:?}");
     assert_eq!(run.status, STATUS_IO, "{run:?}");
@@ -176,9 +197,18 @@ fn e4_short_write_append_leaves_a_tolerated_suffix() {
     assert_eq!(file_len(&path), SEED_LEN + 256);
 
     let (mut store, session) = unlock(&path, PASS_A);
-    assert_eq!(value_of(&mut store, &session, KEEP.0).unwrap(), KEEP.1);
-    assert_eq!(value_of(&mut store, &session, OTHER.0).unwrap(), OTHER.1);
-    assert_eq!(value_of(&mut store, &session, THIRD.0).unwrap(), THIRD.1);
+    assert_eq!(
+        value_of(&mut store, &session, KEEP.0).unwrap().as_slice(),
+        KEEP.1
+    );
+    assert_eq!(
+        value_of(&mut store, &session, OTHER.0).unwrap().as_slice(),
+        OTHER.1
+    );
+    assert_eq!(
+        value_of(&mut store, &session, THIRD.0).unwrap().as_slice(),
+        THIRD.1
+    );
     // Reader tolerance: the partial block is ignored, `new` is lost.
     assert!(value_of(&mut store, &session, b"new").is_none());
     // The next mutation rejects the non-512-multiple length.
@@ -230,7 +260,11 @@ fn e4_flush_failure_reports_unknown_with_visible_write() {
         PASS_A,
         KEEP.0,
         b"KEEP-NEW\n",
-        &[String::from("fault"), String::from("after"), String::from("io")],
+        &[
+            String::from("fault"),
+            String::from("after"),
+            String::from("io"),
+        ],
     );
     assert_eq!(run.code, 2, "flush failure must fail the mutation: {run:?}");
     assert_eq!(run.status, STATUS_IO, "{run:?}");
@@ -239,8 +273,14 @@ fn e4_flush_failure_reports_unknown_with_visible_write() {
     // The write landed: complete store, new record visible.
     assert_eq!(file_len(&path), SEED_LEN);
     let (mut store, session) = unlock(&path, PASS_A);
-    assert_eq!(value_of(&mut store, &session, KEEP.0).unwrap(), b"KEEP-NEW\n");
-    assert_eq!(value_of(&mut store, &session, OTHER.0).unwrap(), OTHER.1);
+    assert_eq!(
+        value_of(&mut store, &session, KEEP.0).unwrap().as_slice(),
+        b"KEEP-NEW\n"
+    );
+    assert_eq!(
+        value_of(&mut store, &session, OTHER.0).unwrap().as_slice(),
+        OTHER.1
+    );
     drop(store);
     drop(session);
     assert_eq!(upstream_dump(&path, KEEP.0, PASS_A).unwrap(), b"KEEP-NEW\n");
@@ -299,9 +339,18 @@ fn e5_kill_mid_write_overwrite_keeps_length_aligned() {
     assert_eq!(file_len(&path) % 512, 0, "length stays 512-aligned");
     assert_eq!(file_len(&path), SEED_LEN);
     let (mut store, session) = unlock(&path, PASS_A);
-    assert!(value_of(&mut store, &session, KEEP.0).is_none(), "torn slot skipped");
-    assert_eq!(value_of(&mut store, &session, OTHER.0).unwrap(), OTHER.1);
-    assert_eq!(value_of(&mut store, &session, THIRD.0).unwrap(), THIRD.1);
+    assert!(
+        value_of(&mut store, &session, KEEP.0).is_none(),
+        "torn slot skipped"
+    );
+    assert_eq!(
+        value_of(&mut store, &session, OTHER.0).unwrap().as_slice(),
+        OTHER.1
+    );
+    assert_eq!(
+        value_of(&mut store, &session, THIRD.0).unwrap().as_slice(),
+        THIRD.1
+    );
     drop(store);
     drop(session);
     assert_eq!(upstream_dump(&path, OTHER.0, PASS_A).unwrap(), OTHER.1);
@@ -322,9 +371,18 @@ fn e5_kill_mid_write_append_leaves_an_orphaned_suffix() {
 
     assert_eq!(file_len(&path), SEED_LEN + 256);
     let (mut store, session) = unlock(&path, PASS_A);
-    assert_eq!(value_of(&mut store, &session, KEEP.0).unwrap(), KEEP.1);
-    assert_eq!(value_of(&mut store, &session, OTHER.0).unwrap(), OTHER.1);
-    assert_eq!(value_of(&mut store, &session, THIRD.0).unwrap(), THIRD.1);
+    assert_eq!(
+        value_of(&mut store, &session, KEEP.0).unwrap().as_slice(),
+        KEEP.1
+    );
+    assert_eq!(
+        value_of(&mut store, &session, OTHER.0).unwrap().as_slice(),
+        OTHER.1
+    );
+    assert_eq!(
+        value_of(&mut store, &session, THIRD.0).unwrap().as_slice(),
+        THIRD.1
+    );
     let failure = store
         .append_or_reuse(None, &session, b"after", b"x")
         .err()
@@ -355,7 +413,10 @@ fn e5_kill_after_write_before_flush_sees_the_new_record() {
 
     assert_eq!(file_len(&path), SEED_LEN);
     let (mut store, session) = unlock(&path, PASS_A);
-    assert_eq!(value_of(&mut store, &session, KEEP.0).unwrap(), b"KEEP-NEW\n");
+    assert_eq!(
+        value_of(&mut store, &session, KEEP.0).unwrap().as_slice(),
+        b"KEEP-NEW\n"
+    );
     drop(store);
     drop(session);
     assert_eq!(upstream_dump(&path, KEEP.0, PASS_A).unwrap(), b"KEEP-NEW\n");
@@ -375,7 +436,10 @@ fn e5_kill_after_write_append_lands_the_complete_record() {
 
     assert_eq!(file_len(&path), SEED_LEN + 512);
     let (mut store, session) = unlock(&path, PASS_A);
-    assert_eq!(value_of(&mut store, &session, b"new").unwrap(), b"NEW-VAL\n");
+    assert_eq!(
+        value_of(&mut store, &session, b"new").unwrap().as_slice(),
+        b"NEW-VAL\n"
+    );
     drop(store);
     drop(session);
     assert_eq!(upstream_dump(&path, b"new", PASS_A).unwrap(), b"NEW-VAL\n");
@@ -394,8 +458,14 @@ fn e5_kill_after_flush_leaves_the_complete_new_store() {
 
     assert_eq!(file_len(&path), SEED_LEN);
     let (mut store, session) = unlock(&path, PASS_A);
-    assert_eq!(value_of(&mut store, &session, KEEP.0).unwrap(), b"KEEP-NEW\n");
-    assert_eq!(value_of(&mut store, &session, OTHER.0).unwrap(), OTHER.1);
+    assert_eq!(
+        value_of(&mut store, &session, KEEP.0).unwrap().as_slice(),
+        b"KEEP-NEW\n"
+    );
+    assert_eq!(
+        value_of(&mut store, &session, OTHER.0).unwrap().as_slice(),
+        OTHER.1
+    );
     drop(store);
     drop(session);
     assert_eq!(upstream_dump(&path, KEEP.0, PASS_A).unwrap(), b"KEEP-NEW\n");
@@ -507,7 +577,11 @@ fn e6_filesystem_matrix_records_per_filesystem_evidence() {
             PASS_A,
             b"new",
             b"x",
-            &[String::from("fault"), String::from("mid"), String::from("short")],
+            &[
+                String::from("fault"),
+                String::from("mid"),
+                String::from("short"),
+            ],
         );
         assert_eq!(run.status, STATUS_IO, "{label} short write: {run:?}");
         assert_eq!(run.state, STATE_UNKNOWN, "{label}: {run:?}");
@@ -516,8 +590,9 @@ fn e6_filesystem_matrix_records_per_filesystem_evidence() {
             2 * 512 + 256,
             "{label}: append class suffix"
         );
-        row.evidence
-            .push(format!("{label}: short-write append → 512N+256 suffix, original intact"));
+        row.evidence.push(format!(
+            "{label}: short-write append → 512N+256 suffix, original intact"
+        ));
         fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -538,7 +613,7 @@ fn e6_filesystem_matrix_records_per_filesystem_evidence() {
         drop(session);
         let (mut store, session) = unlock(&path, PASS_A);
         assert_eq!(
-            value_of(&mut store, &session, KEEP.0).unwrap(),
+            value_of(&mut store, &session, KEEP.0).unwrap().as_slice(),
             b"K3\n",
             "{label}: kill-after visibility"
         );
@@ -599,7 +674,11 @@ fn e6_filesystem_matrix_records_per_filesystem_evidence() {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        json.push_str(if i + 1 == rows.len() { "    }\n" } else { "    },\n" });
+        json.push_str(if i + 1 == rows.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
     }
     json.push_str("  ]\n}\n");
     println!("E6 filesystem matrix:\n{json}");
@@ -614,7 +693,8 @@ fn e6_filesystem_matrix_records_per_filesystem_evidence() {
 
     // The matrix must contain real executed evidence (never vacuous).
     assert!(
-        rows.iter().any(|r| r.evidence.iter().any(|e| !e.starts_with("NO EVIDENCE"))),
+        rows.iter()
+            .any(|r| r.evidence.iter().any(|e| !e.starts_with("NO EVIDENCE"))),
         "at least one filesystem row must carry executed evidence"
     );
 }

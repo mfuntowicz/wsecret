@@ -58,7 +58,7 @@ To create a store with a different KDF cost:
 .\target\release\wsecret.exe init opslimit 250000
 ```
 
-`opslimit` must be at least `10000`; the default is `100000`. It is stored in the file and participates in key derivation.
+`opslimit` is stored in the unauthenticated header. The minimum is `10000`, the creation default is `100000`, and wsecret's normal maximum is `1000000`. Above that maximum, wsecret refuses the store before deriving a key. For a **known, trusted** legacy store, use `wsecret --allow-expensive-kdf list` (or another command). The override removes the upper bound for that invocation; do not use it to inspect an unknown store.
 
 ## Commands
 
@@ -75,7 +75,7 @@ To create a store with a different KDF cost:
 | `wsecret pass KEY [SUBKEY ...]` | Derive and print a deterministic secret without storing it. |
 | `wsecret agent [CMD [ARG ...]]` | Launch a trusted child process with agent access. |
 | `wsecret ssh keygen KEY` | Generate and store an Ed25519 key without writing a private key file; print only the public key. |
-| `wsecret ssh agent KEY [CMD [ARG ...]]` | Add the stored key to Windows `ssh-agent`, launch a trusted child, and remove the identity on clean exit. |
+| `wsecret ssh agent KEY [CMD [ARG ...]]` | Make the stored SSH identity available through Windows OpenSSH for the child's lifetime; do not pass a vault session. |
 | `wsecret version` | Print the upstream-compatible version (`0.21`). |
 
 Exit codes are `0` for success or an intentional empty result, `1` for `Fatal: …`, `254` for parser help, and `255` for usage errors or completion.
@@ -135,9 +135,11 @@ The same store, passphrase, and component sequence produces the same output on u
 
 With no `CMD`, wsecret uses `$SHELL`, then `%ComSpec%`. Do not set `SECRET_AGENT` yourself; wsecret creates it for the trusted child.
 
+For both `agent` and `ssh agent`, use a fully qualified local `.exe` path for programs you installed yourself. Bare names are restricted to trusted Windows system directories; the current directory and `PATH` are not searched. Resolution happens before the vault is unlocked. Trust the executable, its dependencies, and any script you explicitly ask it to run.
+
 ### SSH keys without private key files
 
-Ed25519 keys can be generated and used without ever writing the private key to disk:
+Generate an Ed25519 identity without exporting a plaintext private-key file:
 
 ```powershell
 # Generate a key in memory and store it encrypted. Only the public key is printed.
@@ -147,11 +149,13 @@ Ed25519 keys can be generated and used without ever writing the private key to d
 .\target\release\wsecret.exe ssh agent github powershell
 ```
 
-The `ssh keygen` output is an ordinary OpenSSH public-key line (`ssh-ed25519 …`) suitable for `authorized_keys`. It contains no private material.
+`ssh keygen` publishes the OpenSSH public-key line only after the vault write commits. If stdout then fails, the private key is already stored; do not rerun key generation or use `dump` to recover the public line (`dump` emits the private value).
 
-`ssh agent` sends the 64-byte private key directly to the existing Windows `ssh-agent` service over its named pipe, sets `SSH_AUTH_SOCK` for the child, and removes the identity when the child exits cleanly. The Microsoft agent performs all SSH signatures. Standard Ed25519 key generation uses the pinned `ed25519-dalek` crate; no private key file or temporary export is created. If wsecret is killed, removal is not guaranteed; use `ssh-add -D` to clear agent identities in that case.
+`ssh agent` accepts only `\\.\pipe\openssh-ssh-agent`. Before writing to a connection, wsecret checks that the handle is a LocalSystem-owned pipe, checks its access rules, and matches the connected server PID to the running `ssh-agent` service. Third-party endpoints, including custom paths in `WSECRET_SSH_AGENT_PIPE`, are unsupported. If the endpoint cannot be verified, wsecret sends no key.
 
-Only Ed25519 keys are supported. The Windows `ssh-agent` service must be running. Set `WSECRET_SSH_AGENT_PIPE` only when you intentionally need a non-default agent endpoint.
+The child receives `SSH_AUTH_SOCK` but no vault capability. This is the user's **shared** OpenSSH agent, not an agent isolated to the child or to one signing identity. The genuine service receives the reusable private key and controls its storage. Only `wsecret agent` grants a child access to the whole unlocked partition.
+
+wsecret coordinates uses of the same public key and refuses to take ownership of a key already loaded. On normal completion it removes the identity it added. Other SSH clients do not participate in wsecret's lock: do not modify that identity externally during the command. If wsecret is killed or cleanup fails, inspect `ssh-add -l` and use `ssh-add -d path\to\matching-public-key.pub` for that key; do not clear unrelated identities.
 
 ## Store location and byte handling
 
@@ -230,14 +234,14 @@ Evidence below was collected on **2026-11-17**, Windows 11 x64, unless stated ot
 
 | Area | Established evidence | Still pending / not claimed |
 |---|---|---|
-| Workspace | **365 tests passed across 15 suites** | No claim beyond the executed host/configuration |
+| Workspace | **430 tests passed** in the locked Windows 11 x64 workspace run on 2026-11-18, plus the standalone process/residency probes below | No claim beyond the executed host/configuration |
 | Upstream compatibility | Real upstream-generated Linux store passes byte-exact `dump`/`list`/`show` checks; same-window upstream TOTP parity passes | Real macOS-origin and Windows→macOS round-trip evidence |
 | Fixture provenance | `upstream-linux-origin.secret` was generated by the pinned upstream binary on Fedora 44/WSL2 | `linux-origin.secret` and `mac-origin.secret` are wsecret-generated stand-ins, not upstream-origin proof |
 | x64 | Native debug tests and optimized release build pass | — |
 | ARM64 | `aarch64-pc-windows-msvc` release build passes; PE machine field is `0xAA64` | Native Windows 11 ARM64 execution and tests |
 | Process protection | P4a/b/d/e/f/g/h/i/j probes pass | P4c privileged controls require an elevated `SeDebugPrivilege` runner |
-| SSH agent | 2/2 live tests pass: public-key-only generation, real Windows-agent add/sign/remove, OpenSSL signature verification, no plaintext-key artifacts | Only Ed25519; clean-exit removal is not guaranteed after a process kill |
-| Concurrency/crash model | Commit-state 10/10, concurrent-writers 7/7, crash-consistency 11/11, R2-A 2/2 | No power-loss durability claim |
+| SSH agent | **10/10** native integration tests on 2026-11-18. An SSH child signed through the real service (OpenSSL verified the signature) without vault access; a general-agent child retained authorized access. Tests also covered preloaded identities, duplicate adds and cooperating launches. | Ed25519 only. No isolation from external agent clients or guaranteed cleanup after a process kill. |
+| Concurrency/crash model | Writer-mutex DACL read back from the kernel; two-writer and access-error tests passed in both Debug and Release on Windows 11 x64 (2026-11-18). Commit-state, crash-consistency and overlapping-unlock checks cover the store. | No power-loss durability claim |
 | Filesystems | NTFS rows executed on C:, D:, E:, F:, and G: | ReFS, FAT32, exFAT, and SMB rows have no evidence |
 | Security review | Behavior-focused tests and an implementation-plan audit were performed | No formal cryptographic audit or proof of security |
 
@@ -253,9 +257,10 @@ Machine-readable fixture provenance and detailed evidence live in:
 `wsecret-core` exposes `Store`, `Session`, `Header`, `Limits`, `ScanOutcome`, and the shared error taxonomy. A host must initialize process protection before creating a session:
 
 ```rust
+use wsecret_core::session::SecretBytes;
 use wsecret_core::{NameError, ScanOutcome, Session, Store};
 
-fn read_secret(path: &std::path::Path, pass: &mut [u8]) -> Result<Vec<u8>, wsecret_core::Error> {
+fn read_secret(path: &std::path::Path, pass: &mut [u8]) -> Result<SecretBytes, wsecret_core::Error> {
     wsecret_core::windows::security::init_process_protection()?;
     let (mut store, header) = Store::open(path)?;
     let mut session = Session::unlock(&header, pass)?;
