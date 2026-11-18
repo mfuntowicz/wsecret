@@ -119,7 +119,7 @@ requires a Win11 ARM64 host/runner and remains **pending**.
   handle-duplication path and documented residual are the same.
 - **Regression evidence:** core 96/96, CLI unit 140/140, crosscheck 15/15,
   malformed-store 17/17, all on x64. The final full workspace run is
-  **364 tests across 15 suites**. No ARM64 runtime claim is made.
+  **365 tests across 15 suites**. No ARM64 runtime claim is made.
 
 ## Concurrent writers and crash model (Windows 11 x64 evidence)
 
@@ -143,10 +143,10 @@ requires a Win11 ARM64 host/runner and remains **pending**.
 
 ## Store-backed SSH agent (Windows 11 x64 evidence)
 
-- **Commands:** `wsecret ssh-keygen KEY` generates a standard Ed25519 keypair
+- **Commands:** `wsecret ssh keygen KEY` generates a standard Ed25519 keypair
   with the pinned `ed25519-dalek` crate, stores the 64-byte `seed || public`
   secret in the encrypted store, and prints only the OpenSSH public-key line.
-  `wsecret ssh-agent KEY [CMD ...]` sends that secret directly to the existing
+  `wsecret ssh agent KEY [CMD ...]` sends that secret directly to the existing
   Microsoft `ssh-agent` over `\\.\pipe\openssh-ssh-agent`, sets
   `SSH_AUTH_SOCK` for the hardened child, and removes the identity on every
   clean return path. The Microsoft agent performs all signatures.

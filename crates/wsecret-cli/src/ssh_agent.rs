@@ -1,7 +1,7 @@
-//! `wsecret ssh-keygen` / `wsecret ssh-agent` support.
+//! `wsecret ssh keygen` / `wsecret ssh agent` support.
 //!
-//! Private keys never touch the filesystem. `ssh-keygen` stores libhydrogen's
-//! 64-byte Ed25519 secret key in the encrypted store. `ssh-agent` sends that
+//! Private keys never touch the filesystem. `ssh keygen` stores a standard
+//! 64-byte Ed25519 secret key in the encrypted store. `ssh agent` sends that
 //! key directly to the existing Windows OpenSSH agent over its named pipe,
 //! launches a trusted child with `SSH_AUTH_SOCK`, and removes the identity on
 //! every clean return path. The Windows agent performs all SSH signatures.

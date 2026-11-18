@@ -337,7 +337,7 @@ trait Platform {
         cmd: &[&OsStr],
         pass_hex: bool,
     ) -> Result<i32, AgentLaunchError>;
-    /// Store-backed Ed25519 agent launch (`ssh-agent KEY [CMD...]`).
+    /// Store-backed Ed25519 agent launch (`ssh agent KEY [CMD...]`).
     fn ssh_agent_launch(
         &mut self,
         store_path: &Path,
@@ -872,7 +872,7 @@ impl<P: Platform> Ctx<P> {
         }
     }
 
-    /// `ssh-keygen KEY`: generate an Ed25519 keypair in memory, store the
+    /// `ssh keygen KEY`: generate an Ed25519 keypair in memory, store the
     /// 64-byte secret key, and print ONLY the OpenSSH public-key line.
     fn run_ssh_keygen(&mut self, key: &[u8]) -> Outcome {
         let mut unlocked = match self.open_session(true, true) {
@@ -920,7 +920,7 @@ impl<P: Platform> Ctx<P> {
         }
     }
 
-    /// `ssh-agent KEY [CMD [ARG...]]`: add the stored Ed25519 key to the
+    /// `ssh agent KEY [CMD [ARG...]]`: add the stored Ed25519 key to the
     /// Windows agent, launch the trusted child, and remove it on clean exit.
     fn run_ssh_agent(&mut self, key: &[u8]) -> Outcome {
         let cmd: Vec<&OsStr> = self.agent_cmd.iter().map(OsString::as_os_str).collect();
@@ -1036,16 +1036,7 @@ fn strip_flags(mut raw: Vec<OsString>) -> (Vec<OsString>, Flags) {
 /// (`--keys-hex` decodes them; `help` is kept literal so the help matrix
 /// still works under the mode).
 const KEY_COMMANDS: &[&[u8]] = &[
-    b"list",
-    b"show",
-    b"dump",
-    b"new",
-    b"set",
-    b"renew",
-    b"update",
-    b"pass",
-    b"ssh-keygen",
-    b"ssh-agent",
+    b"list", b"show", b"dump", b"new", b"set", b"renew", b"update", b"pass", b"ssh",
 ];
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -1081,7 +1072,7 @@ fn encode_argv(words: &[OsString], keys_hex: bool) -> Result<Vec<Vec<u8>>, Vec<u
             && raw != b"help"
             && words.get(1).is_some_and(|cmd| {
                 let cmd = cmd.as_encoded_bytes();
-                KEY_COMMANDS.contains(&cmd) && (index == 2 || cmd != b"ssh-agent")
+                KEY_COMMANDS.contains(&cmd) && (cmd != b"ssh" || index == 3)
             });
         if decode {
             out.push(decode_hex(raw).ok_or_else(msg_invalid_input)?);
@@ -1172,12 +1163,18 @@ fn run_main(raw: Vec<OsString>, mut platform: impl Platform) -> u32 {
         }
     };
     let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-    // `agent` and `ssh-agent` take their child command words as original
+    // `agent` and `ssh agent` take their child command words as original
     // `OsString`s (byte-exact for `CreateProcessW`); everything else runs on
-    // the encoded bytes. `ssh-agent` additionally has a key operand to skip.
+    // the encoded bytes. `ssh agent` additionally has a key operand to skip.
     let agent_cmd = match words.get(1).map(|word| word.as_encoded_bytes()) {
         Some(b"agent") => words[2..].to_vec(),
-        Some(b"ssh-agent") => words[3..].to_vec(),
+        Some(b"ssh")
+            if words
+                .get(2)
+                .is_some_and(|sub| sub.as_encoded_bytes() == b"agent") =>
+        {
+            words[4..].to_vec()
+        }
         _ => Vec::new(),
     };
     let stdout_is_tty = platform.stdout_is_console();

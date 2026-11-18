@@ -115,7 +115,7 @@ fn ssh_keygen_prints_only_public_key_and_stores_64_byte_secret() {
     let run = harness::run_wsecret_lines(
         &console,
         &store,
-        &["ssh-keygen", "test/ssh"],
+        &["ssh", "keygen", "test/ssh"],
         &[PASS, PASS],
         None,
         ChildStdout::CaptureFile(&output),
@@ -192,13 +192,7 @@ fn ssh_agent_adds_signs_and_removes_without_plaintext_key_files() {
     let run = harness::run_wsecret(
         &console,
         &store,
-        &[
-            "ssh-agent",
-            &key,
-            "cmd",
-            "/c",
-            "ping 127.0.0.1 -n 4",
-        ],
+        &["ssh", "agent", &key, "cmd", "/c", "ping 127.0.0.1 -n 4"],
         PASS,
         None,
         ChildStdout::CaptureFile(&output),

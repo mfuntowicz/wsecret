@@ -63,7 +63,7 @@ const ARGZ_LEN: usize = 14;
 const FATAL_CAP: usize = 256;
 
 /// The top-level command table in upstream `main()` order (`secret.c:914`).
-pub const COMMANDS: [(&str, &str); 13] = [
+pub const COMMANDS: [(&str, &str); 12] = [
     ("init", "Initialize secret"),
     ("list", "List all secrets for a given passphrase"),
     ("show", "Print a secret"),
@@ -74,11 +74,7 @@ pub const COMMANDS: [(&str, &str); 13] = [
     ("update", "Update an existing secret"),
     ("pass", "Print a deterministic secret"),
     ("agent", "Run a process in a trusted zone"),
-    (
-        "ssh-keygen",
-        "Generate an Ed25519 SSH key without a key file",
-    ),
-    ("ssh-agent", "Use an Ed25519 key through Windows ssh-agent"),
+    ("ssh", "Generate and use Ed25519 SSH keys without key files"),
     ("version", "Show version"),
 ];
 
@@ -120,9 +116,9 @@ pub enum Command<'a> {
     Pass { keys: &'a [&'a [u8]] },
     /// `agent [CMD [ARG…]]` — `cmd` empty means the `$SHELL` fallback.
     Agent { cmd: &'a [&'a [u8]] },
-    /// `ssh-keygen KEY` — generate and store an Ed25519 key in memory only.
+    /// `ssh keygen KEY` — generate and store an Ed25519 key in memory only.
     SshKeygen { key: &'a [u8] },
-    /// `ssh-agent KEY [CMD [ARG…]]` — add the key to Windows ssh-agent,
+    /// `ssh agent KEY [CMD [ARG…]]` — add the key to Windows ssh-agent,
     /// launch the trusted child, and remove the identity on clean exit.
     SshAgent { key: &'a [u8], cmd: &'a [&'a [u8]] },
     /// `version`.
@@ -485,15 +481,14 @@ fn command_help(command: &'static str, argc: usize) -> HelpBranch {
             usage: "Usage: pass KEY [SUBKEY...]\n",
             names: NamesAction::None,
         },
-        "ssh-keygen" => HelpBranch {
+        "ssh" => HelpBranch {
             command,
-            usage: "Usage: ssh-keygen KEY \n",
-            names: names(true),
-        },
-        "ssh-agent" => HelpBranch {
-            command,
-            usage: "Usage: ssh-agent KEY [CMD [ARG...]]\n",
-            names: names(true),
+            usage: "Usage: ssh keygen KEY | ssh agent KEY [CMD [ARG...]]\n",
+            names: if argc == 3 {
+                NamesAction::List
+            } else {
+                NamesAction::None
+            },
         },
         // s_agent L792: `argz_help`; non-tty prints the literal `CMD`.
         "agent" => HelpBranch {
@@ -534,10 +529,13 @@ fn build_command<'a>(name: &str, rest: &'a [&'a [u8]]) -> Command<'a> {
         },
         "pass" => Command::Pass { keys: rest },
         "agent" => Command::Agent { cmd: rest },
-        "ssh-keygen" => Command::SshKeygen { key: rest[0] },
-        "ssh-agent" => Command::SshAgent {
-            key: rest[0],
-            cmd: &rest[1..],
+        "ssh" => match rest[0] {
+            b"keygen" => Command::SshKeygen { key: rest[1] },
+            b"agent" => Command::SshAgent {
+                key: rest[1],
+                cmd: &rest[2..],
+            },
+            _ => unreachable!("SSH subcommand was validated"),
         },
         _ => unreachable!("no command body for {name}"),
     }
@@ -613,14 +611,25 @@ pub fn parse<'a>(argv: &'a [&'a [u8]]) -> Outcome<'a> {
         if rest.iter().any(|w| *w == b"help") {
             return Outcome::Help(command_help(name, argc_c));
         }
+        if name == "ssh" {
+            if rest.is_empty() {
+                return Outcome::Help(command_help(name, argc_c));
+            }
+            if rest[0] != b"keygen" && rest[0] != b"agent" {
+                return unknown_word(rest[0]);
+            }
+        }
         let arity_ok = match name {
             "list" => argc_c <= 2,
             "show" | "dump" | "new" | "set" | "renew" => argc_c == 2,
             "update" => (2..=3).contains(&argc_c),
             "pass" => argc_c >= 2,
             "agent" => true,
-            "ssh-keygen" => argc_c == 2,
-            "ssh-agent" => argc_c >= 2,
+            "ssh" => match rest[0] {
+                b"keygen" => argc_c == 3,
+                b"agent" => argc_c >= 3,
+                _ => unreachable!("SSH subcommand was validated"),
+            },
             _ => unreachable!("no arity rule for {name}"),
         };
         if !arity_ok {
@@ -774,7 +783,7 @@ mod tests {
         assert!(table.starts_with("  init            Initialize secret\n"));
         assert!(table.contains("  update          Update an existing secret\n"));
         assert!(table.ends_with("  version         Show version\n"));
-        assert_eq!(table.lines().count(), 13);
+        assert_eq!(table.lines().count(), 12);
     }
 
     // ---- parser-level `help` (exit 254) --------------------------------
@@ -852,7 +861,7 @@ mod tests {
     // ---- command recognition ------------------------------------------
 
     #[test]
-    fn all_thirteen_commands_are_recognized() {
+    fn all_twelve_commands_are_recognized() {
         assert_cmd(
             &["init"],
             Command::Init {
@@ -874,22 +883,28 @@ mod tests {
         );
         assert_cmd(&["pass", "k"], Command::Pass { keys: &[b"k"] });
         assert_cmd(&["agent"], Command::Agent { cmd: &[] });
-        assert_cmd(&["ssh-keygen", "k"], Command::SshKeygen { key: b"k" });
+        assert_cmd(&["ssh", "keygen", "k"], Command::SshKeygen { key: b"k" });
         assert_cmd(
-            &["ssh-agent", "k"],
+            &["ssh", "agent", "k"],
             Command::SshAgent {
                 key: b"k",
                 cmd: &[],
             },
         );
         assert_cmd(
-            &["ssh-agent", "k", "ssh", "host"],
+            &["ssh", "agent", "k", "ssh", "host"],
             Command::SshAgent {
                 key: b"k",
                 cmd: &[b"ssh", b"host"],
             },
         );
         assert_cmd(&["version"], Command::Version);
+    }
+
+    #[test]
+    fn ssh_requires_a_known_subcommand() {
+        assert!(matches!(parse(&argv_of(&["ssh"])), Outcome::Help(_)));
+        assert_eq!(err_of(&["ssh", "bogus"]), b"Option bogus is unknown");
     }
 
     #[test]
