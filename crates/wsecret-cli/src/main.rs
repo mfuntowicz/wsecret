@@ -1,62 +1,68 @@
 //! `wsecret` command-line interface (bin target `wsecret`).
 //!
-//! Command dispatch for the eleven upstream commands (`secret.c`, pinned
-//! `angt/secret` revision), wired onto `wsecret-core` store operations and
-//! the sibling modules of this crate:
+//! Command dispatch for the store commands of the pinned upstream tool
+//! (`secret.c`, `angt/secret`) plus the `ssh` group, wired onto
+//! `wsecret-core` store operations and the sibling modules of this crate:
 //!
 //! - `args` (library target): the argz-exact parser, the command table, the
 //!   parser-level `help`/usage branches and the `Option %s …` messages.
 //! - [`console`]: `CONIN$`/`CONOUT$` prompting with echo suppression.
 //! - [`output`]: `show`/`dump` rendering (TOTP dispatch, `s_printable`,
 //!   Base64) and byte-exact stdout/stderr writes.
-//! - [`agent`]: trusted-agent acquisition and launch.
+//! - [`unlock`]: the shared passphrase prompts and the unlock + no-records
+//!   confirmation helper used by `ssh agent`.
 //!
 //! This file owns:
 //!
 //! 1. **Command dispatch** ([`Ctx::run`]) for `init`, `list`, `show`, `dump`,
-//!    `new`, `set`, `renew`, `update`, `pass`, `agent` and `version`,
-//!    including upstream's empty-input exit-0 policy, the no-records
-//!    confirmation gate (`s_get_secret` `pass_ok` semantics) and the staged
-//!    generate/print/commit flow for `new`/`renew` (the secret is printed
-//!    BEFORE the write — plan audit P9).
+//!    `new`, `set`, `renew`, `update`, `pass`, `ssh keygen`, `ssh agent` and
+//!    `version`, including upstream's empty-input exit-0 policy, the
+//!    no-records confirmation gate (`s_get_secret` `pass_ok` semantics) and
+//!    the staged generate/print/commit flow for `new`/`renew` (the secret is
+//!    printed BEFORE the write — plan audit P9). Upstream's general `agent`
+//!    command is removed: its word is an ordinary unknown word
+//!    (`Option agent is unknown`).
 //! 2. **The fatal string catalog** ([`msg_*`]): the literal upstream strings
 //!    with their typos preserved (`Unkown version`, `Special characaters`).
 //!    Every fatal is rendered as `Fatal: <body>\n` through
 //!    [`args::fatal_line`] (upstream's 256-byte truncation) on stderr.
 //! 3. **The help/completion matrix** (plan §4, audit P8): `… help` with a
 //!    console stdout prints the usage line and exits 255; with a redirected
-//!    stdout an authorized session lists names and exits 255 while an
-//!    unauthorized (no agent capability) invocation exits 0 silently without
-//!    opening `CONIN$`; `new`/`set help` produce NO usage and NO names.
+//!    stdout the `show`/`dump`/`renew`/`update` `help` forms run the
+//!    non-interactive completion probe ([`Ctx::run_completion_probe`]): the
+//!    store is opened and validated — store errors are `Fatal: …`, exactly
+//!    upstream's `s_print_keys(NULL, 0)` → `s_open_secret(use_tty=0)` path —
+//!    and the run then exits 0 silently without opening `CONIN$`. Name
+//!    listing required the removed trusted-agent capability, so upstream's
+//!    unauthorized case is the only remaining one; `new`/`set help` produce
+//!    NO usage and NO names.
 //!
 //! Exit codes (plan §4): 0 success / silent empty-input exit, 1 `Fatal: …`,
 //! 255 usage, 254 parser help ([`args::run`] produces 255/254 itself).
 
-mod agent;
 mod console;
 mod output;
 mod ssh_agent;
+mod unlock;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use wsecret_cli::args::{self, Command, Dispatch, EXIT_FATAL, EXIT_OK, EXIT_USAGE};
+use wsecret_cli::args::{self, Command, Dispatch, EXIT_FATAL, EXIT_OK};
 use wsecret_core::error::{CommitFailure, CommitState, Error, FormatError, NameError};
-use wsecret_core::format::{Header, NAME_MAX, VERSION};
+use wsecret_core::format::{NAME_MAX, VERSION};
 use wsecret_core::pass::{self, deterministic_pass};
-use wsecret_core::session::{SecretBytes, Session};
+use wsecret_core::session::{SecretBytes, Session, sessions_same_key};
 use wsecret_core::store::{Limits, ScanMeta, ScanOutcome, Store};
-use wsecret_core::windows::agent_bridge::sessions_same_key;
 
-use crate::agent::AgentLaunchError;
 use crate::console::ConsoleError;
 use crate::ssh_agent::SshAgentError;
 
 /// Upstream `s_ask_pass("Passphrase: ")`.
-const PROMPT_PASSPHRASE: &str = agent::PROMPT_PASSPHRASE;
+const PROMPT_PASSPHRASE: &str = unlock::PROMPT_PASSPHRASE;
 /// Upstream `s_get_secret`'s no-records retype prompt.
-const PROMPT_CONFIRM: &str = agent::PROMPT_CONFIRM_NEW_PARTITION;
+const PROMPT_CONFIRM: &str = unlock::PROMPT_CONFIRM_NEW_PARTITION;
 /// Upstream `s_input(secret, sizeof(secret), "Secret: ")`.
 const PROMPT_SECRET: &str = "Secret: ";
 /// Upstream `S_ENV_STORE`.
@@ -208,32 +214,6 @@ fn msg_passphrases_dont_match() -> Vec<u8> {
     b"Passphrases don't match!".to_vec()
 }
 
-/// `s_init`: `if (getenv(S_ENV_AGENT)) s_fatal("Agent is running...")`.
-fn msg_agent_running() -> Vec<u8> {
-    b"Agent is running...".to_vec()
-}
-
-/// `s_agent`: `if (getenv(S_ENV_AGENT)) s_fatal("Already running...")`.
-///
-/// (Body rendered at the `AgentLaunchError` site; kept here as catalog
-/// documentation and asserted by the tests.)
-#[allow(dead_code)]
-fn msg_already_running() -> Vec<u8> {
-    b"Already running...".to_vec()
-}
-
-/// `s_fatal("Missing env SHELL, nothing to exec!")`.
-#[allow(dead_code)]
-fn msg_missing_shell() -> Vec<u8> {
-    b"Missing env SHELL, nothing to exec!".to_vec()
-}
-
-/// `s_fatal("Unable to queue the key")`.
-#[allow(dead_code)]
-fn msg_unable_to_queue() -> Vec<u8> {
-    b"Unable to queue the key".to_vec()
-}
-
 /// `s_set_path`: `s_fatal("Invalid path... Check $HOME or $" S_ENV_STORE)`.
 fn msg_invalid_path() -> Vec<u8> {
     b"Invalid path... Check $HOME or $SECRET_STORE".to_vec()
@@ -293,7 +273,7 @@ enum Outcome {
     /// Exit with this code without further output.
     Code(u32),
     /// Upstream `s_exit(0)`: prompt EOF/empty input, wrong-passphrase
-    /// `list`, unauthorized non-interactive completion.
+    /// `list`, the non-interactive completion probe.
     Silent,
     /// `Fatal: <body>\n` on stderr, exit 1.
     Fatal(Vec<u8>),
@@ -345,7 +325,7 @@ fn console_message(error: &ConsoleError) -> Vec<u8> {
 }
 
 /// Everything the dispatch touches outside `wsecret-core`: console
-/// prompting, raw stdio, and the trusted-agent transport. Production wires
+/// prompting, raw stdio, and the SSH-agent transport. Production wires
 /// [`RealPlatform`]; tests substitute a scripted one, which is what makes
 /// the dispatch logic unit-testable without a console or a child process.
 trait Platform {
@@ -361,22 +341,10 @@ trait Platform {
     fn write_stdout(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Byte-exact stderr write for `Fatal: …` lines.
     fn write_stderr(&mut self, bytes: &[u8]) -> io::Result<()>;
-    /// Trusted-agent key adoption (`s_ask_agent`): `None` falls back to the
-    /// passphrase path.
-    fn agent_acquire(&mut self, header: &Header) -> Option<Session>;
-    /// Trusted-agent launch (`s_agent`), returning the child's exit code.
-    /// `limits` is the launcher's OWN store-open policy (WS-06): it governs
-    /// only the parent's open/unlock and is never injected into the child's
-    /// argv or environment.
-    fn agent_launch(
-        &mut self,
-        store_path: &Path,
-        cmd: &[&OsStr],
-        pass_hex: bool,
-        limits: Limits,
-    ) -> Result<i32, AgentLaunchError>;
-    /// Store-backed Ed25519 agent launch (`ssh agent KEY [CMD...]`);
-    /// `limits` as in [`Platform::agent_launch`].
+    /// Store-backed Ed25519 agent launch (`ssh agent KEY [CMD...]`),
+    /// returning the child's exit code. `limits` is the launcher's OWN
+    /// store-open policy (WS-06): it governs only the parent's open/unlock
+    /// and is never injected into the child's argv or environment.
     fn ssh_agent_launch(
         &mut self,
         store_path: &Path,
@@ -385,11 +353,9 @@ trait Platform {
         pass_hex: bool,
         limits: Limits,
     ) -> Result<i32, SshAgentError>;
-    /// Upstream `getenv(S_ENV_AGENT)` presence test used by `init`.
-    fn agent_env_set(&self) -> bool;
 }
 
-/// Production platform: the real console/output/agent modules.
+/// Production platform: the real console/output/ssh-agent modules.
 struct RealPlatform;
 
 impl Platform for RealPlatform {
@@ -417,24 +383,6 @@ impl Platform for RealPlatform {
         output::write_stderr(bytes)
     }
 
-    fn agent_acquire(&mut self, header: &Header) -> Option<Session> {
-        agent::acquire(header)
-    }
-
-    fn agent_launch(
-        &mut self,
-        store_path: &Path,
-        cmd: &[&OsStr],
-        pass_hex: bool,
-        limits: Limits,
-    ) -> Result<i32, AgentLaunchError> {
-        let mut prompt = |p: &str| -> io::Result<Vec<u8>> {
-            self.read_passphrase(p, pass_hex)
-                .map_err(|e| io::Error::other(e.to_string()))
-        };
-        agent::launch(store_path, cmd, limits, &mut prompt)
-    }
-
     fn ssh_agent_launch(
         &mut self,
         store_path: &Path,
@@ -448,10 +396,6 @@ impl Platform for RealPlatform {
                 .map_err(|e| io::Error::other(e.to_string()))
         };
         ssh_agent::launch(store_path, key, cmd, limits, &mut prompt)
-    }
-
-    fn agent_env_set(&self) -> bool {
-        std::env::var_os(wsecret_core::windows::agent_bridge::ENV_AGENT).is_some()
     }
 }
 
@@ -470,11 +414,12 @@ struct Ctx<'a, P> {
     pass_hex: bool,
     /// Open policy for this invocation (WS-06): the ordinary `ops_limit`
     /// ceiling unless the leading `--allow-expensive-kdf` explicitly lifted
-    /// it. Applied to every store open (commands, `agent`, `ssh agent`).
+    /// it. Applied to every store open (commands and `ssh agent`).
     limits: Limits,
-    /// `agent` command words as original `OsString`s (byte-exact argv for
-    /// `CreateProcessW`; never round-tripped through UTF-8).
-    agent_cmd: &'a [OsString],
+    /// `ssh agent KEY` child command words as original `OsString`s
+    /// (byte-exact argv for `CreateProcessW`; never round-tripped through
+    /// UTF-8).
+    child_cmd: &'a [OsString],
 }
 
 impl<P: Platform> Ctx<'_, P> {
@@ -512,10 +457,11 @@ impl<P: Platform> Ctx<'_, P> {
         self.error(&failure.error)
     }
 
-    /// Upstream `s_open_secret`: open, validate the header, adopt the agent
-    /// key when offered, otherwise prompt on the console. `use_tty == false`
-    /// is the non-interactive completion path: no agent capability means the
-    /// upstream silent `s_exit(0)` ([`Outcome::Silent`]).
+    /// Upstream `s_open_secret`: open, validate the header, then prompt on
+    /// the console. `use_tty == false` is the non-interactive completion
+    /// probe: nothing is prompted and the upstream silent `s_exit(0)`
+    /// ([`Outcome::Silent`]) follows the open — store errors before that
+    /// point are still `Fatal: …` (upstream `s_open_secret(use_tty=0)`).
     fn open_session(&mut self, use_tty: bool, writable: bool) -> Result<Unlocked, Outcome> {
         let opened = if writable {
             Store::open_with_limits(&self.store_path, self.limits)
@@ -526,15 +472,12 @@ impl<P: Platform> Ctx<'_, P> {
             Ok(opened) => opened,
             Err(e) => return Err(self.error(&e)),
         };
-        // Cover agent adoption and console passphrase acquisition, not just
-        // the nested KDF guard inside Session::unlock/from_parts.
+        // Cover console passphrase acquisition, not just the nested KDF
+        // guard inside Session::unlock/from_parts.
         let _acquisition = match wsecret_core::windows::security::begin_secret_acquisition() {
             Ok(guard) => guard,
             Err(error) => return Err(self.error(&error)),
         };
-        if let Some(session) = self.platform.agent_acquire(&header) {
-            return Ok(Unlocked { store, session });
-        }
         if !use_tty {
             return Err(Outcome::Silent);
         }
@@ -641,16 +584,16 @@ impl<P: Platform> Ctx<'_, P> {
         self.write_stdout(&out)
     }
 
-    /// Non-interactive name completion (`s_print_keys(NULL, 0)`): names and
-    /// exit 255 when authorized, silent exit 0 otherwise (audit P8).
-    fn run_complete_names(&mut self) -> Outcome {
-        let unlocked = match self.open_session(false, false) {
-            Ok(unlocked) => unlocked,
-            Err(outcome) => return outcome,
-        };
-        match self.list_names(unlocked, None) {
-            Ok(()) => Outcome::Code(EXIT_USAGE),
+    /// Non-interactive completion probe (`s_print_keys(NULL, 0)`): open and
+    /// validate the store read-only — store errors are `Fatal: …` (upstream
+    /// `s_open_secret(use_tty=0)`) — then exit 0 silently (audit P8). Name
+    /// listing required the removed trusted-agent capability, so upstream's
+    /// unauthorized case is the only remaining one and `CONIN$` is never
+    /// opened.
+    fn run_completion_probe(&mut self) -> Outcome {
+        match self.open_session(false, false) {
             Err(outcome) => outcome,
+            Ok(_) => unreachable!("the non-interactive probe never prompts"),
         }
     }
 
@@ -938,24 +881,6 @@ impl<P: Platform> Ctx<'_, P> {
         }
     }
 
-    /// `agent [CMD [ARG...]]`: launch the trusted zone and propagate the
-    /// child's exit code (upstream `execvp` semantics).
-    fn run_agent(&mut self) -> Outcome {
-        let cmd: Vec<&OsStr> = self.agent_cmd.iter().map(OsString::as_os_str).collect();
-        match self
-            .platform
-            .agent_launch(&self.store_path, &cmd, self.pass_hex, self.limits)
-        {
-            Ok(code) => Outcome::Code(code as u32),
-            Err(AgentLaunchError::Cancelled) => Outcome::Silent,
-            Err(AgentLaunchError::Core(e)) => self.error(&e),
-            Err(e) => match e.message() {
-                Some(body) => Outcome::fatal(body.into_bytes()),
-                None => Outcome::Silent,
-            },
-        }
-    }
-
     /// `ssh keygen KEY`: generate an Ed25519 keypair in memory and commit the
     /// 64-byte secret key BEFORE publishing anything, then print ONLY the
     /// OpenSSH public-key line — and only on a confirmed commit (README:
@@ -1046,7 +971,7 @@ impl<P: Platform> Ctx<'_, P> {
     /// `ssh agent KEY [CMD [ARG...]]`: add the stored Ed25519 key to the
     /// Windows agent, launch the trusted child, and remove it on clean exit.
     fn run_ssh_agent(&mut self, key: &[u8]) -> Outcome {
-        let cmd: Vec<&OsStr> = self.agent_cmd.iter().map(OsString::as_os_str).collect();
+        let cmd: Vec<&OsStr> = self.child_cmd.iter().map(OsString::as_os_str).collect();
         match self.platform.ssh_agent_launch(
             &self.store_path,
             key,
@@ -1081,9 +1006,6 @@ impl<P: Platform> Ctx<'_, P> {
     /// enforced by option parsing and `Store::create`). A cap rejection
     /// reports limit exceeded, the numerical bound and the explicit remedy.
     fn run_init(&mut self, ops_limit: u64) -> Outcome {
-        if self.platform.agent_env_set() {
-            return Outcome::fatal(msg_agent_running());
-        }
         if let Err(error) = self.limits.check_opslimit(ops_limit) {
             return self.error(&error);
         }
@@ -1105,7 +1027,6 @@ impl<P: Platform> Ctx<'_, P> {
             Command::Renew { key } => self.run_renew(key),
             Command::Update { key, new_key } => self.run_update(key, new_key),
             Command::Pass { keys } => self.run_pass(keys),
-            Command::Agent { .. } => self.run_agent(),
             Command::SshKeygen { key } => self.run_ssh_keygen(key),
             Command::SshAgent { key, .. } => self.run_ssh_agent(key),
             Command::Version => self.run_version(),
@@ -1127,8 +1048,8 @@ impl<P: Platform> Dispatch for Ctx<'_, P> {
         self.finish(outcome)
     }
 
-    fn complete_names(&mut self) -> u32 {
-        let outcome = self.run_complete_names();
+    fn completion_probe(&mut self) -> u32 {
+        let outcome = self.run_completion_probe();
         self.finish(outcome)
     }
 }
@@ -1142,13 +1063,13 @@ impl<P: Platform> Dispatch for Ctx<'_, P> {
 ///
 /// `--allow-expensive-kdf` (WS-06) is stricter: honored ONLY in the global
 /// leading position — the flag run before the command word. It is never read
-/// from the environment and never from `agent`/`ssh agent` child command
-/// words (the parent must not derive it from child args, and the child argv
-/// is passed through verbatim). Outside the leading run the word stays in
-/// argv untouched: an ordinary operand for the argz walk, a literal child
-/// argument for `agent`/`ssh agent`. Duplicate leading occurrences are
-/// idempotent. It lifts only the `ops_limit` ceiling for THIS invocation;
-/// the 10000 floor still applies.
+/// from the environment and never from `ssh agent` child command words (the
+/// parent must not derive it from child args, and the child argv is passed
+/// through verbatim). Outside the leading run the word stays in argv
+/// untouched: an ordinary operand for the argz walk, a literal child
+/// argument for `ssh agent`. Duplicate leading occurrences are idempotent.
+/// It lifts only the `ops_limit` ceiling for THIS invocation; the 10000
+/// floor still applies.
 struct Flags {
     keys_hex: bool,
     pass_hex: bool,
@@ -1309,11 +1230,10 @@ fn run_main(
         }
     };
     let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-    // `agent` and `ssh agent` take their child command words as original
-    // `OsString`s (byte-exact for `CreateProcessW`); everything else runs on
-    // the encoded bytes. `ssh agent` additionally has a key operand to skip.
-    let agent_cmd = match words.as_slice() {
-        [_, cmd, child @ ..] if cmd == "agent" => child,
+    // `ssh agent` takes its child command words as original `OsString`s
+    // (byte-exact for `CreateProcessW`); everything else runs on the encoded
+    // bytes. The key operand is skipped.
+    let child_cmd = match words.as_slice() {
         [_, cmd, sub, _, child @ ..] if cmd == "ssh" && sub == "agent" => child,
         _ => &[],
     };
@@ -1322,7 +1242,7 @@ fn run_main(
     // `wsecret_core::store::OPS_LIMIT_MAX` (1_000_000). Only the explicit
     // `--allow-expensive-kdf` in the global leading position lifts the
     // ceiling — for this invocation only; never from the environment, never
-    // from `agent`/`ssh agent` child args. The 10000 floor still applies.
+    // from `ssh agent` child args. The 10000 floor still applies.
     let limits = if flags.allow_expensive_kdf {
         Limits::allow_expensive_kdf()
     } else {
@@ -1333,7 +1253,7 @@ fn run_main(
         platform,
         pass_hex: flags.pass_hex,
         limits,
-        agent_cmd,
+        child_cmd,
     };
     let mut cli = args::Cli {
         stdout_is_tty,
@@ -1344,13 +1264,13 @@ fn run_main(
 }
 
 fn main() {
-    libhydrogen_sys::init();
-    // §5.8: harden the process and every existing thread before argument
-    // dispatch, store access, agent adoption, prompting, or KDF execution.
+    // First application action: restrict access before even seeding the PRNG.
+    // Windows has already created the process; this cannot revoke earlier handles.
     if let Err(error) = wsecret_core::windows::security::init_process_protection() {
         let _ = output::write_stderr(&args::fatal_line(error.to_string().as_bytes()));
         std::process::exit(EXIT_FATAL as i32);
     }
+    libhydrogen_sys::init();
     // Upstream installs its no-op signal handlers before any work (plan §4
     // console-ctrl parity); setup failure is ignored like upstream's.
     let _ = console::install_console_ctrl_handler();
@@ -1379,8 +1299,8 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use wsecret_core::error::AgentError;
-    use wsecret_core::format::OPS_LIMIT_MIN;
+    use wsecret_cli::args::EXIT_USAGE;
+    use wsecret_core::format::{Header, OPS_LIMIT_MIN};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -1429,7 +1349,7 @@ mod tests {
     }
 
     /// Scripted [`Platform`]: fixed passphrases, queued secret values, a
-    /// switchable agent capability and captured stdio. This is what makes
+    /// scripted `ssh agent` launch and captured stdio. This is what makes
     /// every dispatch path testable without a console or a child process.
     struct FakePlatform {
         passphrase: Vec<u8>,
@@ -1438,8 +1358,6 @@ mod tests {
         /// Optional prompt gate for the concurrent-writer regression: ready
         /// is signaled after the scan, before the write can proceed.
         secret_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-        agent_session: bool,
-        agent_env: bool,
         launch: LaunchScript,
         stdout_tty: bool,
         /// Injected [`Platform::write_stdout`] failure (publication-failure
@@ -1449,17 +1367,14 @@ mod tests {
         err: Vec<u8>,
         prompts: Vec<String>,
         /// The `Limits` each launch call received (WS-06: proves the open
-        /// policy reaches `agent`/`ssh agent` and is never derived from
-        /// child args).
+        /// policy reaches `ssh agent` and is never derived from child args).
         launch_limits: Vec<Limits>,
     }
 
     #[derive(Clone, Debug)]
     enum LaunchScript {
         Code(i32),
-        AlreadyRunning,
         MissingShell,
-        QueueKey,
         Exec(&'static str, &'static str),
         Cancelled,
         Mismatch,
@@ -1473,8 +1388,6 @@ mod tests {
                 confirm: None,
                 secrets: VecDeque::new(),
                 secret_gate: None,
-                agent_session: false,
-                agent_env: false,
                 launch: LaunchScript::Code(0),
                 stdout_tty: false,
                 stdout_fail: false,
@@ -1488,14 +1401,6 @@ mod tests {
         fn tty() -> FakePlatform {
             FakePlatform {
                 stdout_tty: true,
-                ..FakePlatform::new()
-            }
-        }
-
-        /// Authorized completion: an agent capability with the fixture key.
-        fn authorized() -> FakePlatform {
-            FakePlatform {
-                agent_session: true,
                 ..FakePlatform::new()
             }
         }
@@ -1549,37 +1454,6 @@ mod tests {
             Ok(())
         }
 
-        fn agent_acquire(&mut self, header: &Header) -> Option<Session> {
-            if self.agent_session {
-                Session::unlock(header, &mut PW.to_vec()).ok()
-            } else {
-                None
-            }
-        }
-
-        fn agent_launch(
-            &mut self,
-            _store_path: &Path,
-            _cmd: &[&OsStr],
-            _pass_hex: bool,
-            limits: Limits,
-        ) -> Result<i32, AgentLaunchError> {
-            self.launch_limits.push(limits);
-            match self.launch.clone() {
-                LaunchScript::Code(code) => Ok(code),
-                LaunchScript::AlreadyRunning => Err(AgentLaunchError::AlreadyRunning),
-                LaunchScript::MissingShell => Err(AgentLaunchError::MissingShell),
-                LaunchScript::QueueKey => Err(AgentLaunchError::QueueKey),
-                LaunchScript::Exec(name, error) => Err(AgentLaunchError::Exec {
-                    name: name.to_owned(),
-                    error: io::Error::other(error),
-                }),
-                LaunchScript::Cancelled => Err(AgentLaunchError::Cancelled),
-                LaunchScript::Mismatch => Err(AgentLaunchError::PassphraseMismatch),
-                LaunchScript::StoreMissing => Err(AgentLaunchError::Core(Error::StoreNotFound)),
-            }
-        }
-
         fn ssh_agent_launch(
             &mut self,
             _store_path: &Path,
@@ -1591,11 +1465,7 @@ mod tests {
             self.launch_limits.push(limits);
             match self.launch.clone() {
                 LaunchScript::Code(code) => Ok(code),
-                LaunchScript::AlreadyRunning => Err(SshAgentError::AlreadyRunning),
                 LaunchScript::MissingShell => Err(SshAgentError::MissingShell),
-                LaunchScript::QueueKey => {
-                    Err(SshAgentError::Core(Error::Agent(AgentError::Unavailable)))
-                }
                 LaunchScript::Exec(name, error) => Err(SshAgentError::Exec {
                     name: name.to_owned(),
                     error: io::Error::other(error),
@@ -1604,10 +1474,6 @@ mod tests {
                 LaunchScript::Mismatch => Err(SshAgentError::Core(Error::PassphraseMismatch)),
                 LaunchScript::StoreMissing => Err(SshAgentError::Core(Error::StoreNotFound)),
             }
-        }
-
-        fn agent_env_set(&self) -> bool {
-            self.agent_env
         }
     }
 
@@ -1623,7 +1489,7 @@ mod tests {
         /// Parser-level errors (the `Option …` messages).
         parser_err: Vec<u8>,
         prompts: Vec<String>,
-        /// The `Limits` each `agent`/`ssh agent` launch received.
+        /// The `Limits` each `ssh agent` launch received.
         launch_limits: Vec<Limits>,
     }
 
@@ -1751,10 +1617,6 @@ mod tests {
             b"Unable to lock /x/.secret"
         );
         assert_eq!(msg_passphrases_dont_match(), b"Passphrases don't match!");
-        assert_eq!(msg_agent_running(), b"Agent is running...");
-        assert_eq!(msg_already_running(), b"Already running...");
-        assert_eq!(msg_missing_shell(), b"Missing env SHELL, nothing to exec!");
-        assert_eq!(msg_unable_to_queue(), b"Unable to queue the key");
         assert_eq!(
             msg_invalid_path(),
             b"Invalid path... Check $HOME or $SECRET_STORE"
@@ -1924,22 +1786,10 @@ mod tests {
     }
 
     #[test]
-    fn authorized_redirected_help_lists_names_and_exits_255() {
-        let fx = Fixture::new(
-            "names",
-            &[(b"alpha", b"1"), (b"BETA", b"2"), (b"DELETED:old", b"3")],
-        );
-        for command in [b"show".as_slice(), b"dump", b"renew", b"update"] {
-            let run = dispatch(&fx.path, FakePlatform::authorized(), &[command, b"help"]);
-            assert_eq!(run.code, EXIT_USAGE, "command: {:?}", command);
-            // Physical order, tombstones included (upstream quirk).
-            assert_eq!(run.out, b"alpha\nBETA\nDELETED:old\n");
-            assert!(run.parser_out.is_empty(), "no usage on a redirected stdout");
-        }
-    }
-
-    #[test]
-    fn unauthorized_redirected_completion_is_silent_and_exits_zero() {
+    fn redirected_completion_is_silent_and_exits_zero() {
+        // Upstream's unauthorized non-interactive completion is the only
+        // remaining case (the trusted-agent capability is gone): the store
+        // is opened and validated, then the run exits 0 silently.
         let fx = Fixture::new("names-unauth", &[(b"alpha", b"1")]);
         for command in [b"show".as_slice(), b"dump", b"renew", b"update"] {
             let run = dispatch(&fx.path, FakePlatform::new(), &[command, b"help"]);
@@ -1952,10 +1802,21 @@ mod tests {
     }
 
     #[test]
+    fn redirected_completion_fatals_on_a_missing_store() {
+        // The probe runs upstream's `s_open_secret(use_tty=0)` sequence:
+        // store errors surface as `Fatal: …` BEFORE the silent exit.
+        let missing = temp_path("names-missing");
+        let run = dispatch(&missing, FakePlatform::new(), &[b"show", b"help"]);
+        assert_eq!(run.code, EXIT_FATAL);
+        assert_eq!(run.err, fatal(&msg_store_missing(missing.as_os_str().as_encoded_bytes())));
+        assert!(run.out.is_empty() && run.prompts.is_empty());
+    }
+
+    #[test]
     fn redirected_new_and_set_help_print_nothing_and_exit_255() {
         let fx = Fixture::new("new-set-help", &[(b"alpha", b"1")]);
         for command in [b"new".as_slice(), b"set"] {
-            let run = dispatch(&fx.path, FakePlatform::authorized(), &[command, b"help"]);
+            let run = dispatch(&fx.path, FakePlatform::new(), &[command, b"help"]);
             assert_eq!(run.code, EXIT_USAGE, "command: {:?}", command);
             assert!(run.out.is_empty(), "no names for {command:?}");
             assert!(run.parser_out.is_empty(), "no usage on a redirected stdout");
@@ -1965,17 +1826,9 @@ mod tests {
     #[test]
     fn list_help_never_lists_names() {
         let fx = Fixture::new("list-help", &[(b"alpha", b"1")]);
-        let run = dispatch(&fx.path, FakePlatform::authorized(), &[b"list", b"help"]);
+        let run = dispatch(&fx.path, FakePlatform::new(), &[b"list", b"help"]);
         assert_eq!(run.code, EXIT_USAGE);
         assert!(run.out.is_empty());
-    }
-
-    #[test]
-    fn agent_help_prints_cmd_word_on_redirected_stdout() {
-        let fx = Fixture::empty("agent-help");
-        let run = dispatch(&fx.path, FakePlatform::new(), &[b"agent", b"help"]);
-        assert_eq!(run.code, EXIT_USAGE);
-        assert_eq!(run.parser_out, b"CMD\n");
     }
 
     #[test]
@@ -2217,12 +2070,12 @@ mod tests {
         assert_eq!(run.err, fatal(&cap_body(max + 1, max)));
         assert!(run.prompts.is_empty(), "cap first: {:?}", run.prompts);
 
-        // `agent` child args: the word is passed through to the child
+        // `ssh agent` child args: the word is passed through to the child
         // verbatim and the parent keeps the ordinary policy.
         let run = dispatch(
             &path,
             FakePlatform::new(),
-            &[b"agent", b"--allow-expensive-kdf", b"cmd"],
+            &[b"ssh", b"agent", b"k", b"--allow-expensive-kdf", b"cmd"],
         );
         assert_eq!(run.code, EXIT_OK, "scripted child exit");
         assert_eq!(
@@ -2245,19 +2098,6 @@ mod tests {
         let path_bytes = path.as_os_str().as_encoded_bytes();
         assert_eq!(run.err, fatal(&msg_store_exists(path_bytes)));
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn init_under_agent_fatals_agent_running() {
-        let path = temp_path("init-agent");
-        let platform = FakePlatform {
-            agent_env: true,
-            ..FakePlatform::new()
-        };
-        let run = dispatch(&path, platform, &[b"init"]);
-        assert_eq!(run.code, EXIT_FATAL);
-        assert_eq!(run.err, fatal(b"Agent is running..."));
-        assert!(!path.exists(), "no store created");
     }
 
     // ---- list --------------------------------------------------------
@@ -2748,11 +2588,11 @@ mod tests {
         );
     }
 
-    // ---- agent -------------------------------------------------------
+    // ---- ssh agent ----------------------------------------------------
 
     #[test]
-    fn agent_propagates_the_child_exit_code() {
-        let fx = Fixture::empty("agent-code");
+    fn ssh_agent_propagates_the_child_exit_code() {
+        let fx = Fixture::empty("ssh-agent-code");
         let platform = FakePlatform {
             launch: LaunchScript::Code(7),
             ..FakePlatform::new()
@@ -2760,68 +2600,48 @@ mod tests {
         let run = dispatch(
             &fx.path,
             platform,
-            &[b"agent", b"cmd", b"/c", b"exit", b"7"],
+            &[b"ssh", b"agent", b"k", b"cmd", b"/c", b"exit", b"7"],
         );
         assert_eq!(run.code, 7);
     }
 
     #[test]
-    fn agent_launch_errors_render_the_catalog() {
-        let fx = Fixture::empty("agent-errs");
+    fn ssh_agent_errors_render_the_catalog() {
+        let fx = Fixture::empty("ssh-agent-errs");
         let cases: &[(LaunchScript, u32, &[u8])] = &[
-            (
-                LaunchScript::AlreadyRunning,
-                EXIT_FATAL,
-                b"Already running...",
-            ),
             (
                 LaunchScript::MissingShell,
                 EXIT_FATAL,
                 b"Missing env SHELL, nothing to exec!",
             ),
-            (
-                LaunchScript::QueueKey,
-                EXIT_FATAL,
-                b"Unable to queue the key",
-            ),
-            (
-                LaunchScript::Exec("prog", "denied"),
-                EXIT_FATAL,
-                b"prog: denied",
-            ),
+            (LaunchScript::Exec("prog", "denied"), EXIT_FATAL, b"prog: denied"),
             (
                 LaunchScript::Mismatch,
                 EXIT_FATAL,
                 b"Passphrases don't match!",
             ),
             (LaunchScript::Cancelled, EXIT_OK, b""),
+            (LaunchScript::StoreMissing, EXIT_FATAL, b""),
         ];
         for (script, code, body) in cases {
             let platform = FakePlatform {
                 launch: script.clone(),
                 ..FakePlatform::new()
             };
-            let run = dispatch(&fx.path, platform, &[b"agent"]);
+            let run = dispatch(&fx.path, platform, &[b"ssh", b"agent", b"k"]);
             assert_eq!(run.code, *code, "script: {script:?}");
             if body.is_empty() {
-                assert!(run.err.is_empty(), "silent exit for {script:?}");
+                if matches!(script, LaunchScript::StoreMissing) {
+                    // Store failures map through the normal error path.
+                    let path_bytes = fx.path.as_os_str().as_encoded_bytes();
+                    assert_eq!(run.err, fatal(&msg_store_missing(path_bytes)));
+                } else {
+                    assert!(run.err.is_empty(), "silent exit for {script:?}");
+                }
             } else {
                 assert_eq!(run.err, fatal(body), "script: {script:?}");
             }
         }
-    }
-
-    #[test]
-    fn agent_core_errors_use_the_catalog() {
-        let fx = Fixture::empty("agent-core");
-        let platform = FakePlatform {
-            launch: LaunchScript::StoreMissing,
-            ..FakePlatform::new()
-        };
-        let run = dispatch(&fx.path, platform, &[b"agent"]);
-        assert_eq!(run.code, EXIT_FATAL);
-        let path_bytes = fx.path.as_os_str().as_encoded_bytes();
-        assert_eq!(run.err, fatal(&msg_store_missing(path_bytes)));
     }
 
     // ---- ssh keygen --------------------------------------------------
@@ -2950,7 +2770,7 @@ mod tests {
             platform: &mut FakePlatform::new(),
             pass_hex: false,
             limits: Limits::default(),
-            agent_cmd: &[],
+            child_cmd: &[],
         };
         let unknown =
             CommitFailure::unknown(Error::Io(io::Error::other("injected mid-write failure")));
@@ -3125,12 +2945,13 @@ mod tests {
         );
         assert_eq!(words, ["wsecret", "show", "--allow-expensive-kdf"]);
 
-        // `agent` child args are passed through verbatim: the parent never
-        // derives the override from them (and never injects one).
+        // `ssh agent` child args are passed through verbatim: the parent
+        // never derives the override from them (and never injects one).
         let (words, flags) = strip_flags(vec![
             OsString::from("wsecret"),
+            OsString::from("ssh"),
             OsString::from("agent"),
-            OsString::from("wsecret"),
+            OsString::from("k"),
             OsString::from("--allow-expensive-kdf"),
             OsString::from("show"),
             OsString::from("x"),
@@ -3143,8 +2964,9 @@ mod tests {
             words,
             [
                 "wsecret",
+                "ssh",
                 "agent",
-                "wsecret",
+                "k",
                 "--allow-expensive-kdf",
                 "show",
                 "x"

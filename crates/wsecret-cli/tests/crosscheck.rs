@@ -39,9 +39,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use harness::{
     base32_decode, blocks, is_console_handle, linux_origin_fixture, oracle_hotp, run_wsecret,
-    sha256, slot_of, standin_fixtures, temp_store, upstream_show, ChildStdout, ConsoleSession,
-    BASE64_MYKEY, LIST_A, LIST_B, PASS_A, PASS_B, PASS_WRONG, VALUE_B1, VALUE_B2, VALUE_B3,
-    VALUE_MYKEY, VALUE_TOMBSTONE, VALUE_TOTP, VALUE_TOTP32, VALUE_TEST,
+    run_wsecret_lines_env, sha256, slot_of, standin_fixtures, temp_store, upstream_show,
+    ChildStdout, ConsoleSession, BASE64_MYKEY, LIST_A, LIST_B, PASS_A, PASS_B, PASS_WRONG,
+    VALUE_B1, VALUE_B2, VALUE_B3, VALUE_MYKEY, VALUE_TOMBSTONE, VALUE_TOTP, VALUE_TOTP32,
+    VALUE_TEST,
 };
 
 fn unix_now() -> u64 {
@@ -638,4 +639,50 @@ fn every_fixture_carries_the_canonical_records() {
     for (tag, store) in &corpus {
         assert_eq!(blocks(store).len(), 9, "{tag}: 9 blocks (header + 8 records)");
     }
+}
+
+// ---------------------------------------------------------------------------
+// intentional divergence (general `agent` removed): legacy `SECRET_AGENT`
+// ---------------------------------------------------------------------------
+
+/// One `wsecret` run whose child environment carries a legacy
+/// `SECRET_AGENT` capability-handle value.
+fn legacy_run(
+    session: &ConsoleSession, store: &Path, args: &[&str], lines: &[&str], tag: &str,
+) -> harness::Run {
+    let os = std::ffi::OsStr::new("404");
+    let out = temp_store(tag);
+    run_wsecret_lines_env(
+        session, store, args, lines, None, ChildStdout::CaptureFile(&out), &[("SECRET_AGENT", os)],
+    )
+}
+
+/// A legacy `SECRET_AGENT` value is inert on every input path: no vault
+/// access (completion stays silent and name-free), values stay gated behind
+/// the ordinary passphrase, and `init` behaves ordinarily. The managed SSH
+/// launch strips the variable from its child (pinned in `p4`/`ssh_agent`).
+#[test]
+fn legacy_secret_agent_cannot_bypass_ordinary_unlock() {
+    let wrong = std::str::from_utf8(PASS_WRONG).unwrap();
+    let session = ConsoleSession::new();
+    session.reset();
+    let store = fresh_copy("legacy-env", &linux_origin_fixture());
+
+    // Completion: silent exit 0, no names (the removed capability path
+    // disclosed names at exit 255 here).
+    let run = legacy_run(&session, &store, &["show", "help"], &[], "legacy-env-completion");
+    assert_eq!(run.code, 0, "completion must stay silent");
+    assert!(run.stdout.is_empty() && run.stderr.is_empty(), "completion disclosed output");
+
+    // Values stay gated: wrong passphrase + legacy variable discloses nothing.
+    let run = legacy_run(&session, &store, &["show", "test"], &[wrong], "legacy-env-show");
+    assert_eq!(run.code, 1, "wrong passphrase must fail closed");
+    assert!(run.stdout.is_empty(), "secret disclosed without the passphrase");
+
+    // `init` is inert to the variable: it behaves ordinarily.
+    let fresh = temp_store("legacy-env-init");
+    let _ = fs::remove_file(&fresh);
+    let run = legacy_run(&session, &fresh, &["init"], &[], "legacy-env-init-out");
+    assert_eq!(run.code, 0, "init must ignore legacy SECRET_AGENT");
+    assert!(fresh.exists(), "init did not create the store");
 }

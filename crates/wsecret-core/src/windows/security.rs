@@ -10,14 +10,15 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-    WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SE_KERNEL_OBJECT, SetSecurityInfo,
@@ -37,8 +38,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateEventW, CreateMutexExW, CreateThread, ExitProcess, GetCurrentProcess,
-    GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, INFINITE, LPTHREAD_START_ROUTINE,
-    MUTEX_MODIFY_STATE, OpenThread, PROCESS_ALL_ACCESS, PROCESS_CREATE_PROCESS,
+    GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, GetProcessIdOfThread, INFINITE,
+    LPTHREAD_START_ROUTINE, MUTEX_MODIFY_STATE, OpenThread, PROCESS_ALL_ACCESS, PROCESS_CREATE_PROCESS,
     PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_LIMITED_INFORMATION,
     PROCESS_TERMINATE, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, ReleaseMutex,
@@ -799,42 +800,65 @@ fn enumerate_threads() -> io::Result<Vec<u32>> {
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: successful CreateToolhelp32Snapshot transfers ownership.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    thread_ids_in_snapshot(&snapshot)
+}
+
+fn thread_ids_in_snapshot(snapshot: &OwnedHandle) -> io::Result<Vec<u32>> {
     let pid = unsafe { GetCurrentProcessId() };
+    let current = unsafe { GetCurrentThreadId() };
     let mut entry = THREADENTRY32 {
         dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
         ..Default::default()
     };
     let mut out = Vec::new();
     // SAFETY: `entry` is initialized with its required size.
-    let mut ok = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while ok {
+    if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut saw_current = false;
+    loop {
+        // Toolhelp can return a shorter structure. Neither ID is evidence
+        // about this process unless the entry includes the owner PID.
+        if (entry.dwSize as usize)
+            < std::mem::offset_of!(THREADENTRY32, th32OwnerProcessID) + size_of::<u32>()
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
         if entry.th32OwnerProcessID == pid {
             out.push(entry.th32ThreadID);
+            saw_current |= entry.th32ThreadID == current;
         }
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         // SAFETY: the snapshot and entry remain live.
-        ok = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+        if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                return Err(error); // A partial snapshot is not proof of protection.
+            }
+            return if saw_current {
+                Ok(out)
+            } else {
+                Err(io::Error::from(io::ErrorKind::InvalidData))
+            };
+        }
     }
-    // SAFETY: owned snapshot handle.
-    unsafe {
-        CloseHandle(snapshot);
-    }
-    Ok(out)
 }
 
 fn harden_thread_id(tid: u32) -> io::Result<()> {
-    // SAFETY: opens the identified thread for the two rights required to read
-    // and replace its DACL. No secret-bearing operation is performed here.
-    let handle = unsafe { OpenThread(WRITE_DAC | READ_CONTROL, 0, tid) };
+    // Thread IDs can be recycled between the system snapshot and OpenThread.
+    let handle =
+        unsafe { OpenThread(WRITE_DAC | READ_CONTROL | THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
     if handle.is_null() {
         return Err(io::Error::last_os_error());
     }
-    let result = harden_object(handle, ObjectKind::Thread);
-    // SAFETY: owned thread handle.
-    unsafe {
-        CloseHandle(handle);
+    // SAFETY: OpenThread returned an owned, non-inheritable handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    if unsafe { GetProcessIdOfThread(handle.as_raw_handle()) } != unsafe { GetCurrentProcessId() } {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
-    result
+    harden_object(handle.as_raw_handle(), ObjectKind::Thread)
 }
 
 struct ProtectionState {
@@ -878,7 +902,10 @@ fn state() -> MutexGuard<'static, ProtectionState> {
 }
 
 fn startup_hardening() -> io::Result<()> {
-    harden_object(unsafe { GetCurrentProcess() }, ObjectKind::Process)?;
+    let process = unsafe { GetCurrentProcess() };
+    apply_security(process, &ObjectSecurity::new(ObjectKind::Process)?)?;
+    // Restrict the calling thread before spending time reading the process
+    // descriptor back. Both descriptors must still verify before admission.
     let current = duplicate_current_thread()?;
     let current_result = harden_object(current, ObjectKind::Thread);
     // SAFETY: owned duplicate.
@@ -886,6 +913,7 @@ fn startup_hardening() -> io::Result<()> {
         CloseHandle(current);
     }
     current_result?;
+    verify_security(process, ObjectKind::Process)?;
 
     let current_id = unsafe { GetCurrentThreadId() };
     let threads = enumerate_threads()?;
@@ -897,7 +925,6 @@ fn startup_hardening() -> io::Result<()> {
     let mut guard = state();
     guard.threads.clear();
     guard.threads.extend(threads);
-    guard.threads.insert(current_id);
     Ok(())
 }
 
@@ -1428,6 +1455,17 @@ pub(crate) fn verify_birth_objects(process: HANDLE, thread: HANDLE) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_without_thread_entries_cannot_admit_a_session() {
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPPROCESS;
+
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+        // SAFETY: successful creation transfers ownership to the test.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+        assert!(thread_ids_in_snapshot(&snapshot).is_err());
+    }
 
     #[test]
     fn mutex_name_is_stable_and_64_hex() {

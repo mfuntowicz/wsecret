@@ -40,8 +40,17 @@
 //!   value and returns the usage exit.
 //! - Commands with an `argz_help(argc, argv)` guard reject a literal `help`
 //!   anywhere in their operands (`s_list` L648, `s_do` L683, `s_show` L719,
-//!   `s_pass` L769, `s_agent` L792) and apply the plan §4 usage/completion
-//!   matrix.
+//!   `s_pass` L769) and apply the plan §4 usage/completion matrix.
+//!
+//! Two deliberate divergences from the pinned upstream table (both are
+//! user-requested surface changes, not parser quirks):
+//! - The general `agent` command (upstream `s_agent` L792) is removed. Its
+//!   word is NOT special-cased: like every word absent from the table it
+//!   stops the walk and reports `Option agent is unknown` (and `agent help`
+//!   reports the same, because an unmatched word breaks the walk before any
+//!   later `help` is examined). `ssh agent` is the `ssh` group's subcommand
+//!   and is unaffected.
+//! - The `ssh` group (`ssh keygen` / `ssh agent`) is a wsecret addition.
 
 use std::io::Write;
 
@@ -62,8 +71,10 @@ const ARGZ_LEN: usize = 14;
 /// `Fatal: ` prefix, the message, and the newline.
 const FATAL_CAP: usize = 256;
 
-/// The top-level command table in upstream `main()` order (`secret.c:914`).
-pub const COMMANDS: [(&str, &str); 12] = [
+/// The top-level command table: the pinned upstream `main()` table
+/// (`secret.c:914`) with two documented changes — the general `agent` row is
+/// removed and the wsecret `ssh` group replaces it (module docs).
+pub const COMMANDS: [(&str, &str); 11] = [
     ("init", "Initialize secret"),
     ("list", "List all secrets for a given passphrase"),
     ("show", "Print a secret"),
@@ -73,7 +84,6 @@ pub const COMMANDS: [(&str, &str); 12] = [
     ("renew", "Regenerate an existing secret"),
     ("update", "Update an existing secret"),
     ("pass", "Print a deterministic secret"),
-    ("agent", "Run a process in a trusted zone"),
     ("ssh", "Generate and use Ed25519 SSH keys without key files"),
     ("version", "Show version"),
 ];
@@ -114,8 +124,6 @@ pub enum Command<'a> {
     /// `pass KEY [SUBKEY…]` — `keys` is every operand including `KEY`; the
     /// derivation chain covers all of them (`s_pass` `secret.c:785`).
     Pass { keys: &'a [&'a [u8]] },
-    /// `agent [CMD [ARG…]]` — `cmd` empty means the `$SHELL` fallback.
-    Agent { cmd: &'a [&'a [u8]] },
     /// `ssh keygen KEY` — generate and store an Ed25519 key in memory only.
     SshKeygen { key: &'a [u8] },
     /// `ssh agent KEY [CMD [ARG…]]` — add the key to Windows ssh-agent,
@@ -128,15 +136,17 @@ pub enum Command<'a> {
 /// Non-tty completion branch of a per-command help matrix (plan §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamesAction {
-    /// No name output at all (`list`, `pass`, `new`, `set`, and the
-    /// multi-word help forms): exit [`EXIT_USAGE`] silently.
+    /// No output at all (`list`, `pass`, `new`, `set`, and the multi-word
+    /// help forms): exit [`EXIT_USAGE`] silently.
     None,
-    /// Print the given word (`CMD` for `agent`), then [`EXIT_USAGE`].
-    Word(&'static str),
-    /// List every stored name to stdout (`show/dump/renew/update help`):
-    /// authorized → [`EXIT_USAGE`] after listing (argz propagates -1);
-    /// unauthorized non-interactive → silent [`EXIT_OK`].
-    List,
+    /// The `show/dump/renew/update help` forms, which upstream routes to
+    /// `s_print_keys(NULL, 0)` — the non-interactive name-completion probe
+    /// ([`Dispatch::completion_probe`]). Name listing required the removed
+    /// trusted-agent capability, so upstream's unauthorized case is the only
+    /// remaining one: the store is opened and validated (store errors are
+    /// `Fatal: …`, upstream `s_open_secret`), then the run exits [`EXIT_OK`]
+    /// silently — without opening `CONIN$`.
+    Completion,
 }
 
 /// A per-command help/usage branch (the upstream `argz_help(argc, argv)`
@@ -150,7 +160,7 @@ pub struct HelpBranch {
     /// argument is empty).
     pub usage: &'static str,
     /// What a non-tty stdout must produce instead of usage.
-    pub names: NamesAction,
+    pub action: NamesAction,
 }
 
 /// Parser result: everything [`run`] needs to finish without re-parsing.
@@ -192,12 +202,15 @@ pub trait Dispatch {
     /// ([`EXIT_OK`] on success, [`EXIT_FATAL`] on a `Fatal: …` condition).
     fn execute(&mut self, command: Command<'_>) -> u32;
 
-    /// Non-tty `… help` completion: list every stored name to stdout.
+    /// Non-interactive `… help` completion probe (upstream
+    /// `s_print_keys(NULL, 0)`): open and validate the store read-only —
+    /// store errors render as `Fatal: …` — then exit silently. Name listing
+    /// required the removed trusted-agent capability, so this always takes
+    /// upstream's unauthorized path and never opens `CONIN$`.
     ///
-    /// Return [`EXIT_OK`] for the silent unauthorized case, [`EXIT_USAGE`]
-    /// after listing (upstream argz propagates -1), [`EXIT_FATAL`] on a
-    /// fatal store condition.
-    fn complete_names(&mut self) -> u32;
+    /// Return [`EXIT_OK`] for the silent case, [`EXIT_FATAL`] on a fatal
+    /// store condition.
+    fn completion_probe(&mut self) -> u32;
 }
 
 /// The upstream `argz_print_help` line (`argz.c:74`): `"  %-14s  %s\n"`.
@@ -426,9 +439,9 @@ fn version_inner(words: &[&[u8]]) -> Inner {
 fn command_help(command: &'static str, argc: usize) -> HelpBranch {
     // `argc` is the command's own argument count including the command word
     // (`s_*` receive `argv + a`).
-    let names = |list_on_two: bool| {
-        if argc == 2 && list_on_two {
-            NamesAction::List
+    let completion = |at_two: bool| {
+        if argc == 2 && at_two {
+            NamesAction::Completion
         } else {
             NamesAction::None
         }
@@ -438,18 +451,18 @@ fn command_help(command: &'static str, argc: usize) -> HelpBranch {
         "list" => HelpBranch {
             command,
             usage: "Usage: list [NEEDLE]\n",
-            names: NamesAction::None,
+            action: NamesAction::None,
         },
         // s_show L719: `argz_help || argc != 2`; non-tty names at argc == 2.
         "show" => HelpBranch {
             command,
             usage: "Usage: show KEY\n",
-            names: names(true),
+            action: completion(true),
         },
         "dump" => HelpBranch {
             command,
             usage: "Usage: dump KEY\n",
-            names: names(true),
+            action: completion(true),
         },
         // s_do L683: `argz_help || (argc != 2 && (op || argc != 3))`.
         // new/set/renew only accept `KEY` (their `op` is truthy); the
@@ -458,44 +471,34 @@ fn command_help(command: &'static str, argc: usize) -> HelpBranch {
         "new" => HelpBranch {
             command,
             usage: "Usage: new KEY \n",
-            names: NamesAction::None,
+            action: NamesAction::None,
         },
         "set" => HelpBranch {
             command,
             usage: "Usage: set KEY \n",
-            names: NamesAction::None,
+            action: NamesAction::None,
         },
         "renew" => HelpBranch {
             command,
             usage: "Usage: renew KEY \n",
-            names: names(true),
+            action: completion(true),
         },
         "update" => HelpBranch {
             command,
             usage: "Usage: update KEY NEWKEY\n",
-            names: names(true),
+            action: completion(true),
         },
         // s_pass L769: `argz_help || argc < 2`; usage only.
         "pass" => HelpBranch {
             command,
             usage: "Usage: pass KEY [SUBKEY...]\n",
-            names: NamesAction::None,
+            action: NamesAction::None,
         },
         "ssh" => HelpBranch {
             command,
             usage: "Usage: ssh keygen KEY | ssh agent KEY [CMD [ARG...]]\n",
-            names: if argc == 3 {
-                NamesAction::List
-            } else {
-                NamesAction::None
-            },
-        },
-        // s_agent L792: `argz_help`; non-tty prints the literal `CMD`.
-        "agent" => HelpBranch {
-            command,
-            usage: "Usage: agent CMD [ARG...]\n",
-            names: if argc == 2 {
-                NamesAction::Word("CMD")
+            action: if argc == 3 {
+                NamesAction::Completion
             } else {
                 NamesAction::None
             },
@@ -528,7 +531,6 @@ fn build_command<'a>(name: &str, rest: &'a [&'a [u8]]) -> Command<'a> {
             new_key: rest.get(1).copied(),
         },
         "pass" => Command::Pass { keys: rest },
-        "agent" => Command::Agent { cmd: rest },
         "ssh" => match rest[0] {
             b"keygen" => Command::SshKeygen { key: rest[1] },
             b"agent" => Command::SshAgent {
@@ -624,7 +626,6 @@ pub fn parse<'a>(argv: &'a [&'a [u8]]) -> Outcome<'a> {
             "show" | "dump" | "new" | "set" | "renew" => argc_c == 2,
             "update" => (2..=3).contains(&argc_c),
             "pass" => argc_c >= 2,
-            "agent" => true,
             "ssh" => match rest[0] {
                 b"keygen" => argc_c == 3,
                 b"agent" => argc_c >= 3,
@@ -671,14 +672,9 @@ pub fn run(argv: &[&[u8]], cli: &mut Cli<'_>, commands: &mut dyn Dispatch) -> u3
                 let _ = cli.stdout.write_all(branch.usage.as_bytes());
                 return EXIT_USAGE;
             }
-            match branch.names {
+            match branch.action {
                 NamesAction::None => EXIT_USAGE,
-                NamesAction::Word(word) => {
-                    let _ = cli.stdout.write_all(word.as_bytes());
-                    let _ = cli.stdout.write_all(b"\n");
-                    EXIT_USAGE
-                }
-                NamesAction::List => commands.complete_names(),
+                NamesAction::Completion => commands.completion_probe(),
             }
         }
     }
@@ -707,8 +703,8 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         calls: Vec<String>,
-        names_code: u32,
-        names_called: bool,
+        probe_code: u32,
+        probe_called: bool,
     }
 
     impl Dispatch for Recording {
@@ -720,9 +716,9 @@ mod tests {
             });
             0
         }
-        fn complete_names(&mut self) -> u32 {
-            self.names_called = true;
-            self.names_code
+        fn completion_probe(&mut self) -> u32 {
+            self.probe_called = true;
+            self.probe_code
         }
     }
 
@@ -783,7 +779,9 @@ mod tests {
         assert!(table.starts_with("  init            Initialize secret\n"));
         assert!(table.contains("  update          Update an existing secret\n"));
         assert!(table.ends_with("  version         Show version\n"));
-        assert_eq!(table.lines().count(), 12);
+        assert_eq!(table.lines().count(), 11);
+        // The general `agent` row is gone; its word is an ordinary unknown.
+        assert!(!table.contains("  agent "));
     }
 
     // ---- parser-level `help` (exit 254) --------------------------------
@@ -861,7 +859,7 @@ mod tests {
     // ---- command recognition ------------------------------------------
 
     #[test]
-    fn all_twelve_commands_are_recognized() {
+    fn all_eleven_commands_are_recognized() {
         assert_cmd(
             &["init"],
             Command::Init {
@@ -882,7 +880,6 @@ mod tests {
             },
         );
         assert_cmd(&["pass", "k"], Command::Pass { keys: &[b"k"] });
-        assert_cmd(&["agent"], Command::Agent { cmd: &[] });
         assert_cmd(&["ssh", "keygen", "k"], Command::SshKeygen { key: b"k" });
         assert_cmd(
             &["ssh", "agent", "k"],
@@ -899,6 +896,22 @@ mod tests {
             },
         );
         assert_cmd(&["version"], Command::Version);
+    }
+
+    #[test]
+    fn agent_is_an_ordinary_unknown_word() {
+        // The general `agent` command is removed and NOT special-cased: the
+        // parser treats it exactly like any other word absent from the
+        // table (same message, same exit path, and a later `help` is never
+        // examined because the unmatched word breaks the walk first).
+        assert_eq!(err_of(&["agent"]), b"Option agent is unknown");
+        assert_eq!(err_of(&["agent", "help"]), b"Option agent is unknown");
+        assert_eq!(err_of(&["agent", "cmd", "help"]), b"Option agent is unknown");
+        let (code, out, err, rec) = run_words(&["agent", "cmd"], true);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert_eq!(err, b"Option agent is unknown\n");
+        assert!(rec.calls.is_empty(), "no command may run");
     }
 
     #[test]
@@ -945,17 +958,6 @@ mod tests {
                 keys: &[b"k", b"a", b"b"],
             },
         );
-    }
-
-    #[test]
-    fn agent_takes_cmd_and_args_with_shell_fallback() {
-        assert_cmd(
-            &["agent", "cmd", "-x"],
-            Command::Agent {
-                cmd: &[b"cmd", b"-x"],
-            },
-        );
-        assert_cmd(&["agent"], Command::Agent { cmd: &[] });
     }
 
     // ---- opslimit (argz_ull) ------------------------------------------
@@ -1093,7 +1095,6 @@ mod tests {
             &["list", "x", "help"][..],
             &["show", "help", "x"][..],
             &["pass", "k", "help"][..],
-            &["agent", "cmd", "help"][..],
             &["update", "k", "help"][..], // NOT a rename to `help`
             &["new", "k", "help"][..],
         ] {
@@ -1140,42 +1141,47 @@ mod tests {
             help_of(&["pass", "help"]).usage,
             "Usage: pass KEY [SUBKEY...]\n"
         );
-        assert_eq!(
-            help_of(&["agent", "help"]).usage,
-            "Usage: agent CMD [ARG...]\n"
-        );
     }
 
     #[test]
     fn names_actions_follow_the_upstream_condition() {
-        // Names only for `… help` (argc == 2) of the generate/rename family.
+        // The completion probe only for `… help` (argc == 2) of the
+        // generate/rename family (upstream routes exactly these to
+        // `s_print_keys(NULL, 0)`).
         for args in [
             &["show", "help"][..],
             &["dump", "help"][..],
             &["renew", "help"][..],
             &["update", "help"][..],
+            &["ssh", "keygen", "help"][..],
         ] {
-            assert_eq!(help_of(args).names, NamesAction::List, "{args:?}");
+            assert_eq!(
+                help_of(args).action,
+                NamesAction::Completion,
+                "{args:?}"
+            );
         }
-        // new/set never list; multi-word help forms never list.
+        // new/set never complete; multi-word help forms never complete.
         for args in [
             &["new", "help"][..],
             &["set", "help"][..],
             &["list", "help"][..],
             &["pass", "help"][..],
             &["show", "help", "x"][..],
-            &["agent", "cmd", "help"][..],
+            &["ssh", "keygen", "help", "x"][..],
         ] {
-            assert_eq!(help_of(args).names, NamesAction::None, "{args:?}");
+            assert_eq!(help_of(args).action, NamesAction::None, "{args:?}");
         }
-        assert_eq!(help_of(&["agent", "help"]).names, NamesAction::Word("CMD"));
     }
 
     #[test]
-    fn run_non_tty_list_names_delegates_to_dispatch() {
-        for code in [EXIT_OK, EXIT_USAGE, EXIT_FATAL] {
+    fn run_non_tty_completion_form_runs_the_probe() {
+        // The `… help` completion forms run the non-interactive probe and
+        // exit with its code (the silent upstream-unauthorized case is 0;
+        // the probe's fatal store conditions are 1). Nothing is printed.
+        for code in [EXIT_OK, EXIT_FATAL] {
             let mut rec = Recording {
-                names_code: code,
+                probe_code: code,
                 ..Default::default()
             };
             let argv = argv_of(&["show", "help"]);
@@ -1188,7 +1194,7 @@ mod tests {
                 };
                 run(&argv, &mut cli, &mut rec)
             };
-            assert!(rec.names_called);
+            assert!(rec.probe_called);
             assert_eq!(rc, code);
             assert!(out.is_empty());
             assert!(err.is_empty());
@@ -1196,18 +1202,15 @@ mod tests {
     }
 
     #[test]
-    fn run_non_tty_word_and_none_branches() {
-        let (code, out, err, rec) = run_words(&["agent", "help"], false);
-        assert_eq!(code, EXIT_USAGE);
-        assert_eq!(String::from_utf8_lossy(&out), "CMD\n");
-        assert!(err.is_empty());
-        assert!(!rec.names_called);
-
-        let (code, out, err, rec) = run_words(&["new", "help"], false);
-        assert_eq!(code, EXIT_USAGE);
-        assert!(out.is_empty());
-        assert!(err.is_empty());
-        assert!(!rec.names_called);
+    fn run_non_tty_none_forms_print_nothing_and_exit_255() {
+        // The `NamesAction::None` forms: no usage, no probe, silent 255.
+        for args in [&["new", "help"][..], &["list", "help"][..]] {
+            let (code, out, err, rec) = run_words(args, false);
+            assert_eq!(code, EXIT_USAGE, "{args:?}");
+            assert!(out.is_empty());
+            assert!(err.is_empty());
+            assert!(!rec.probe_called);
+        }
     }
 
     #[test]

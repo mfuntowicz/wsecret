@@ -2,9 +2,9 @@
 
 `wsecret` is a Windows implementation of [`angt/secret`](https://github.com/angt/secret), written in Rust with a small wrapper around the pinned upstream **libhydrogen C** implementation.
 
-It stores encrypted names and values in one portable `.secret` file, supports multiple passphrases, deterministic secrets, TOTP, and a trusted-agent workflow. The command-line interface is compatible with the pinned upstream release.
+It stores encrypted names and values in one portable `.secret` file and supports multiple passphrases, deterministic secrets, TOTP, and Windows OpenSSH. Unlike upstream, wsecret does not provide a full-vault `agent` command: each invocation that needs vault access unlocks for itself.
 
-**Current status:** the library and CLI are implemented. The full workspace suite passes on Windows 11 x64. ARM64 cross-compilation works; native ARM64 execution is still unverified. See [Proof status](#proof-status).
+**Current status:** the library and CLI run on Windows 11 x64. ARM64 has cross-build evidence only; native ARM64 execution is unverified. See [Proof status](#proof-status).
 
 ## Requirements
 
@@ -73,7 +73,6 @@ To create a store with a different KDF cost:
 | `wsecret renew KEY` | Replace an existing value with a newly generated secret. |
 | `wsecret update KEY [NEWKEY]` | Replace a value, optionally renaming the record. |
 | `wsecret pass KEY [SUBKEY ...]` | Derive and print a deterministic secret without storing it. |
-| `wsecret agent [CMD [ARG ...]]` | Launch a trusted child process with agent access. |
 | `wsecret ssh keygen KEY` | Generate and store an Ed25519 key without writing a private key file; print only the public key. |
 | `wsecret ssh agent KEY [CMD [ARG ...]]` | Make the stored SSH identity available through Windows OpenSSH for the child's lifetime; do not pass a vault session. |
 | `wsecret version` | Print the upstream-compatible version (`0.21`). |
@@ -126,17 +125,6 @@ A name containing `totp` treats the stored value as a TOTP seed:
 
 The same store, passphrase, and component sequence produces the same output on upstream and wsecret.
 
-### Trusted agent
-
-```powershell
-# Start PowerShell with agent access for itself and its descendants.
-.\target\release\wsecret.exe agent powershell
-```
-
-With no `CMD`, wsecret uses `$SHELL`, then `%ComSpec%`. Do not set `SECRET_AGENT` yourself; wsecret creates it for the trusted child.
-
-For both `agent` and `ssh agent`, use a fully qualified local `.exe` path for programs you installed yourself. Bare names are restricted to trusted Windows system directories; the current directory and `PATH` are not searched. Resolution happens before the vault is unlocked. Trust the executable, its dependencies, and any script you explicitly ask it to run.
-
 ### SSH keys without private key files
 
 Generate an Ed25519 identity without exporting a plaintext private-key file:
@@ -146,14 +134,16 @@ Generate an Ed25519 identity without exporting a plaintext private-key file:
 .\target\release\wsecret.exe ssh keygen github
 
 # Start PowerShell with that key available through Windows ssh-agent.
-.\target\release\wsecret.exe ssh agent github powershell
+.\target\release\wsecret.exe ssh agent github powershell.exe -NoProfile
 ```
 
 `ssh keygen` publishes the OpenSSH public-key line only after the vault write commits. If stdout then fails, the private key is already stored; do not rerun key generation or use `dump` to recover the public line (`dump` emits the private value).
 
 `ssh agent` accepts only `\\.\pipe\openssh-ssh-agent`. Before writing to a connection, wsecret checks that the handle is a LocalSystem-owned pipe, checks its access rules, and matches the connected server PID to the running `ssh-agent` service. Third-party endpoints, including custom paths in `WSECRET_SSH_AGENT_PIPE`, are unsupported. If the endpoint cannot be verified, wsecret sends no key.
 
-The child receives `SSH_AUTH_SOCK` but no vault capability. This is the user's **shared** OpenSSH agent, not an agent isolated to the child or to one signing identity. The genuine service receives the reusable private key and controls its storage. Only `wsecret agent` grants a child access to the whole unlocked partition.
+The child receives `SSH_AUTH_SOCK`, not the vault session key. This is the user's **shared** OpenSSH agent, not an agent isolated to the child or to one signing identity. The genuine service receives the reusable private key and controls its storage.
+
+With no child command, `ssh agent` uses `$SHELL`, then `%ComSpec%`. To choose a program you installed yourself, pass a fully qualified local `.exe` path. Bare names are restricted to trusted Windows system directories; the current directory and `PATH` are not searched. Trust the child, its dependencies, and any shell startup scripts with access to the loaded SSH identity.
 
 wsecret coordinates uses of the same public key and refuses to take ownership of a key already loaded. On normal completion it removes the identity it added. Other SSH clients do not participate in wsecret's lock: do not modify that identity externally during the command. If wsecret is killed or cleanup fails, inspect `ssh-add -l` and use `ssh-add -d path\to\matching-public-key.pub` for that key; do not clear unrelated identities.
 
@@ -191,7 +181,7 @@ For binary values, use `dump` and a byte-preserving redirection mechanism. Avoid
 
 - The store uses upstream format version 0 and 512-byte blocks. Names and values are encrypted independently for each passphrase.
 - The file is **not** tied to a Windows account or machine. DPAPI protects the unlocked session key **in memory**, not the portable store.
-- Process and thread DACLs, `OWNER_RIGHTS`, child-birth descriptors, reduced launcher handles, and a residency watchdog enforce the same-user, non-privileged boundary.
+- The standalone executable restricts access to its process and threads as its first action in `main`, before crypto initialization, store access, or a passphrase prompt. It refuses to proceed if the protections cannot be applied and verified. No wsecret service or installer is required.
 - Secret buffers are page-locked, zeroized, and excluded from WER dumps where supported. Idle session keys are `CryptProtectMemory` ciphertext; plaintext exists only during operation windows.
 - Cooperating writers serialize through a canonical named mutex and per-record `LockFileEx`. Mutations preserve records belonging to other passphrases.
 - Malformed and truncated inputs are rejected with bounded parsing; upstream-compatible read tolerance is retained where documented.
@@ -199,7 +189,7 @@ For binary values, use `dump` and a byte-preserving redirection mechanism. Avoid
 Important limits:
 
 - Administrators, `SeDebugPrivilege`, kernel tools, and malicious code already inside the trusted zone are outside the same-user boundary.
-- An external launcher may retain a full-access handle to wsecret. This is a documented residual; wsecret-controlled launches reduce their retained handles.
+- Startup hardening restricts **new** access requests. It cannot revoke handles granted before `main` (including a handle retained by the launcher), and does not guarantee protection from malware already running as your Windows user.
 - A newly created unregistered thread can exist for one watchdog poll interval before detection.
 - The format has no whole-store anti-rollback or authenticated header. These are inherited upstream limitations, not claims of stronger file integrity.
 - Process-kill tests are not power-loss durability proof.
@@ -240,7 +230,7 @@ Evidence below was collected on **2026-11-17**, Windows 11 x64, unless stated ot
 | x64 | Native debug tests and optimized release build pass | — |
 | ARM64 | `aarch64-pc-windows-msvc` release build passes; PE machine field is `0xAA64` | Native Windows 11 ARM64 execution and tests |
 | Process protection | P4a/b/d/e/f/g/h/i/j probes pass | P4c privileged controls require an elevated `SeDebugPrivilege` runner |
-| SSH agent | **10/10** native integration tests on 2026-11-18. An SSH child signed through the real service (OpenSSL verified the signature) without vault access; a general-agent child retained authorized access. Tests also covered preloaded identities, duplicate adds and cooperating launches. | Ed25519 only. No isolation from external agent clients or guaranteed cleanup after a process kill. |
+| SSH agent | All 9 native integration tests passed after removal of the full-vault agent, including signing through the real service without vault access, preloaded identities, and cooperating launches. | Ed25519 only. No isolation from external agent clients or guaranteed cleanup after a process kill. |
 | Concurrency/crash model | Writer-mutex DACL read back from the kernel; two-writer and access-error tests passed in both Debug and Release on Windows 11 x64 (2026-11-18). Commit-state, crash-consistency and overlapping-unlock checks cover the store. | No power-loss durability claim |
 | Filesystems | NTFS rows executed on C:, D:, E:, F:, and G: | ReFS, FAT32, exFAT, and SMB rows have no evidence |
 | Security review | Behavior-focused tests and an implementation-plan audit were performed | No formal cryptographic audit or proof of security |
@@ -283,7 +273,7 @@ The future WinUI 3 C ABI is a design contract only; **no C ABI crate or GUI appl
 |---|---|
 | `crates/libhydrogen-sys/` | Pinned libhydrogen C, safe Rust wrapper, and upstream KATs |
 | `crates/wsecret-core/` | Store format, sessions, cryptography dispatch, Windows security, and core tests |
-| `crates/wsecret-cli/` | `wsecret.exe`, console/agent behavior, and CLI acceptance tests |
+| `crates/wsecret-cli/` | `wsecret.exe`, console and OpenSSH commands, and CLI acceptance tests |
 | `fixtures/upstream/` | Minimal pinned upstream sources required by compatibility oracles |
 | `fixtures/` | Store fixtures, manifests, oracle tools, and filesystem evidence |
 

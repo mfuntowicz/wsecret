@@ -24,8 +24,9 @@
 //!    (RESOURCE_LIMIT = 8) BEFORE any KDF execution or prompt (timed). The
 //!    explicit `--allow-expensive-kdf` in the global leading position (or
 //!    `Limits::allow_expensive_kdf()`) is the only override, is never
-//!    inherited from the environment or `agent` child args, and does not
-//!    lift the 10000 floor. `init` is bounded consistently and the cap
+//!    inherited from the environment (including the legacy `SECRET_AGENT`
+//!    variable, which is inert on every input path) or child args, and does
+//!    not lift the 10000 floor. `init` is bounded consistently and the cap
 //!    rejection names the limit exceeded, the numerical bound and the
 //!    explicit remedy.
 //! 7. Name byte-class matrix: accept `a`, `a/b`, `héllo`, `~!@#$%^&*()`,

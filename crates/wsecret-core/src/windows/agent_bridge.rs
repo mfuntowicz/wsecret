@@ -1,92 +1,49 @@
-//! Native-only agent-capability bridge (plan §3.4): `AgentCapability` and
-//! `AgentPipe` for the trusted-agent handoff protocol (plan §5.2/§5.8).
+//! Native-only hardened process launching (plan §5.2/§5.8): trusted
+//! executable resolution, birth-hardened `CreateProcessW`, and child
+//! wait/teardown for `wsecret ssh agent`.
 //!
 //! This module is one of the two sanctioned `unsafe` modules (the other is
 //! `libhydrogen-sys`); the CLI crate contains **no** unsafe code and drives
-//! the protocol only through the safe facades below. No message byte ever
-//! appears in a public signature: the 81-byte message
-//! (`WSECRET1` ‖ 41-byte header ‖ 32-byte key, plan §5.2 step 4) is built,
-//! written, peeked and validated entirely inside this module.
+//! everything through the safe facades below.
 //!
-//! Wire contract (plan §1.9/§5.2, the Windows adaptation of upstream
-//! `s_agent`/`s_ask_agent`):
+//! The former vault-agent capability transport is gone: no capability
+//! message is ever built, no handle value is ever adopted, and no session key
+//! crosses this module. [`spawn_ssh_child`] inherits only the deliberately
+//! duplicated standard handles, advertises `SSH_AUTH_SOCK` naming the
+//! VERIFIED Windows OpenSSH agent endpoint, and strips the legacy
+//! `SECRET_AGENT` entry from the child environment.
 //!
-//! - **Launch**: [`AgentCapability::from_session`] drains the key out of an
-//!   unlocked [`Session`] into a secure buffer; [`AgentPipe::create`] makes a
-//!   non-inheritable pipe whose security descriptor carries a
-//!   **proper empty DACL** (an empty DACL denies every new open — a NULL
-//!   DACL would grant everyone, plan §5.2 step 5; the probe-verified
-//!   server-side named-pipe realization of that rule is documented on
-//!   [`AgentPipe`]); the message is written
-//!   into the pipe buffer **before** the child exists, so the buffered bytes
-//!   are ready for a non-blocking peek on day one;
-//!   [`AgentPipe::mark_read_inheritable`] marks only the read handle
-//!   inheritable, and [`spawn_trusted_child`] passes that handle through
-//!   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (plus deliberately duplicated std
-//!   handles — nothing else inherits) and closes the launcher's own pipe
-//!   handles immediately after `CreateProcessW`.
-//! - **Acquisition**: [`AgentPipe::peek_adopt`] / [`adopt_from_handle_value`]
-//!   peek the buffered message
-//!   **without consuming it** (upstream `MSG_PEEK` semantics — every
-//!   descendant of the trusted shell can adopt the key), requires exactly 81
-//!   bytes available, checks the `WSECRET1` magic and compares the embedded
-//!   header to the store header just read in constant time
-//!   ([`libhydrogen_sys::equal`]). A match adopts the 32-byte key into a
-//!   session marked [`UnlockEvidence::AgentAuthorized`]; any mismatch
-//!   zeroizes the peek buffer and returns `Ok(None)` — the caller falls back
-//!   to the passphrase path (upstream: mismatch zeroes the key and re-prompts).
+//! Surface:
 //!
-//! # Narrowed assurance (audit P13) — READ THIS
-//!
-//! Header equality alone authorizes the adopting process *without* any record
-//! decryption. A forged message carrying an attacker key therefore makes all
-//! existing records fail authentication, but the adopter will happily ENCRYPT
-//! newly entered secrets (`set`/`new`) under the attacker's key and derive
-//! deterministic secrets from it. The launching environment and the inherited
-//! handle are consequently **trusted inputs**: a malicious launcher can
-//! capture future secret entries. This is upstream's exact behavior (its
-//! `s_ask_agent` does the same). It is NOT evidence that an unrelated process
-//! can acquire the real pipe: the pipe DACL denies every new open and handle
-//! numbers are meaningless outside the inheriting process tree.
-//!
-//! # Teardown (plan §5.2)
-//!
-//! Each process zeroizes its session and closes its handles on
-//! return/unwind ([`AgentCapability`] and [`AgentPipe`] zeroize/close on
-//! drop, [`Session::lock`] is idempotent); the pipe dies when the last handle
-//! closes, destroying the buffered message with it. Shell exit is NOT
-//! revocation for detached descendants, and there is no idle timeout
-//! (upstream has none; a timeout would not revoke copies already made).
+//! - [`resolve_executable`]: policy-checked resolution of the child program
+//!   (trusted bare names and explicit fully qualified paths only — no PATH,
+//!   no current directory, no namespace paths).
+//! - [`spawn_ssh_child`]: birth-hardened spawn — `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+//!   limits inheritance to the duplicated std handles, the birth descriptors
+//!   are verified before the child may run, and the launcher keeps only a
+//!   `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` handle.
+//! - [`AgentChild`]: wait for the child and read its exit status through the
+//!   reduced handle.
 
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
-};
-use windows_sys::Win32::Security::Authorization::{SE_KERNEL_OBJECT, SetSecurityInfo};
-use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
-    PROTECTED_DACL_SECURITY_INFORMATION,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_PIPE, GetFileAttributesW, GetFileType, INVALID_FILE_ATTRIBUTES,
-    OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, SYNCHRONIZE, WriteFile,
+    FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
-use windows_sys::Win32::System::Pipes::{
-    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
-};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
     INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
@@ -94,441 +51,15 @@ use windows_sys::Win32::System::Threading::{
 
 use super::security::{ProcessBirthSecurity, verify_birth_objects};
 use crate::error::Error;
-use crate::format::{HEADER_LEN, Header};
-use crate::session::{SecretBytes, Session, UnlockEvidence};
 
-/// The agent transport environment variable (plan §5.2; upstream `S_ENV_AGENT`).
+/// The legacy vault-agent environment variable (upstream `S_ENV_AGENT`).
+/// The vault agent is gone; the name is kept only so [`spawn_ssh_child`] can
+/// guarantee it never reaches the SSH child.
 pub const ENV_AGENT: &str = "SECRET_AGENT";
 /// The endpoint variable consumed by Win32 OpenSSH clients. Its value is the
 /// VERIFIED full named-pipe path (e.g. `\\.\pipe\openssh-ssh-agent`), passed
 /// verbatim — never shortened (WS-04).
 pub const ENV_SSH_AUTH_SOCK: &str = "SSH_AUTH_SOCK";
-
-/// Agent magic: 8 ASCII bytes `WSECRET1` (plan §5.2 step 4).
-pub const AGENT_MAGIC: [u8; 8] = *b"WSECRET1";
-/// Full agent message: magic (8) + upstream header (41) + key (32).
-pub const AGENT_MSG_LEN: usize = 8 + HEADER_LEN + 32;
-/// Offset of the 41-byte upstream header inside the message.
-pub const AGENT_HEADER_OFF: usize = 8;
-/// Offset of the 32-byte derived key inside the message.
-pub const AGENT_KEY_OFF: usize = 8 + HEADER_LEN;
-
-/// Explicit 41-byte header encoding (plan §1.2/§5.2 step 4: "explicit byte
-/// encoding; no struct serialization"): `version[1] master[32] ops_limit[8 LE]`
-/// — byte-identical to the first 41 bytes of the store's header block, which
-/// is what upstream `s_ask_agent` compares against.
-fn encode_header(header: &Header) -> [u8; HEADER_LEN] {
-    let mut out = [0u8; HEADER_LEN];
-    out[0] = header.version;
-    out[1..33].copy_from_slice(&header.master);
-    out[33..41].copy_from_slice(&header.ops_limit.to_le_bytes());
-    out
-}
-
-/// A one-shot, zeroizing copy of an unlocked session key plus the exact store
-/// header (plan §3.4: opaque capability; no message bytes in any public
-/// signature).
-///
-/// Created with [`AgentCapability::from_session`] (which drains the session)
-/// and consumed **by value** by [`AgentCapability::write_to_pipe`]. The
-/// secure buffer is zeroized on drop on every outcome — success, partial
-/// write or error — and the error never carries key material.
-pub struct AgentCapability {
-    /// `WSECRET1` ‖ 41-byte header ‖ 32-byte key, in a locked secure buffer.
-    msg: SecretBytes,
-}
-
-impl AgentCapability {
-    /// Moves the key out of `session` into this capability's secure buffer
-    /// (plan §3.4). The session is left **locked/drained** — `&mut` makes the
-    /// move sound. On failure the session is untouched; on success it is
-    /// drained before this function returns.
-    pub fn from_session(session: &mut Session) -> Result<AgentCapability, Error> {
-        if session.is_locked() {
-            return Err(Error::Locked);
-        }
-        let header = session.header().clone();
-        // Transient plaintext copy of the key (per-operation decrypt window).
-        let key = session.with_key(|k| *k)?;
-        let mut msg = SecretBytes::new(AGENT_MSG_LEN)?;
-        {
-            let buf = msg.as_mut_slice();
-            buf[0..8].copy_from_slice(&AGENT_MAGIC);
-            buf[AGENT_HEADER_OFF..AGENT_HEADER_OFF + HEADER_LEN]
-                .copy_from_slice(&encode_header(&header));
-            buf[AGENT_KEY_OFF..AGENT_KEY_OFF + 32].copy_from_slice(&key);
-        }
-        // `key` (a plain stack copy) is erased before returning.
-        let mut key = key;
-        libhydrogen_sys::memzero(&mut key);
-        // Drain the source session: the capability now owns the only copy.
-        session.lock();
-        Ok(AgentCapability { msg })
-    }
-
-    /// Writes the capability message into the pipe buffer and **consumes the
-    /// capability by value** (plan §3.4 one-shot rule): on every outcome the
-    /// capability's secure buffer is zeroized on drop and the error carries
-    /// no key material. The write must deliver EXACTLY [`AGENT_MSG_LEN`]
-    /// bytes (plan §5.2 step 6: "require exact write").
-    ///
-    /// The pipe is consumed and handed back so the launcher keeps owning the
-    /// handles it still needs (mark-read-inheritable → spawn → close): the
-    /// security-relevant rule — the capability is consumed BY VALUE, so a
-    /// second write is impossible — holds exactly as specified. On write
-    /// failure the pipe is dropped with the error (handles closed, buffered
-    /// message destroyed: plan §5.2 "Launch failure → close both ends").
-    pub fn write_to_pipe(self, pipe: AgentPipe) -> Result<AgentPipe, Error> {
-        match pipe.write_exact(self.msg.as_slice()) {
-            // `self` drops on both paths — buffer zeroized.
-            Ok(()) => Ok(pipe),
-            Err(e) => {
-                drop(pipe);
-                Err(e)
-            }
-        }
-    }
-
-    /// The exact 81-byte message (in-module use and tests only — never
-    /// exposed in a public signature).
-    #[cfg(test)]
-    fn message(&self) -> &[u8] {
-        self.msg.as_slice()
-    }
-}
-
-impl Drop for AgentCapability {
-    fn drop(&mut self) {
-        // `SecretBytes::drop` zeroizes too; `clear` makes the intent explicit.
-        self.msg.clear();
-    }
-}
-
-/// An opaque, platform-owned pipe wrapper (plan §3.4): created only by
-/// [`AgentPipe::create`], carrying a **proper empty DACL**. It owns both pipe
-/// handles and closes them on drop.
-///
-/// # Why a server-side named pipe (probe-verified, 2026-11-17)
-///
-/// Plan §5.2 step 5 asks for `CreatePipe` with "a proper empty DACL — empty
-/// denies all **new** opens; null grants everyone". Two Windows realities
-/// make the literal recipe impossible (verified by direct probe on this
-/// host):
-///
-/// 1. `CreatePipe` **access-checks the passed `SECURITY_ATTRIBUTES` at
-///    creation**: an empty DACL denies the creator too — `CreatePipe` returns
-///    `ERROR_ACCESS_DENIED` and NO handles (null DACL succeeds). The DACL is
-///    not merely "deny future opens"; it is checked before the handles exist.
-/// 2. Anonymous-pipe handles are opened without `WRITE_DAC`, and pipe objects
-///    do not support `DuplicateHandle` access upgrades (`ERROR_ACCESS_DENIED`)
-///    — so the DACL can never be tightened after creation either.
-///
-/// The one probe-verified realization of the plan's security GOAL is a
-/// server-side named pipe: its creation handle can carry `WRITE_DAC`
-/// (`READ_CONTROL` is rejected in `dwOpenMode`; `PIPE_ACCESS_OUTBOUND |
-/// WRITE_DAC` succeeds), the client (read) end is opened through the pipe's
-/// default descriptor BEFORE the tighten, and `SetSecurityInfo(
-/// DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, empty
-/// ACL)` then replaces the DACL with the **proper empty DACL** — exactly the
-/// plan's "empty denies all new opens": a probe `CreateFileW` on the name
-/// afterwards fails with `ERROR_ACCESS_DENIED` even for the creator, while
-/// already-open handles keep working (I/O performs no new access checks).
-/// Probe also verified: 81 bytes written before the launcher closes the
-/// server end remain `PeekNamedPipe`-visible (`got=81 avail=81`) afterwards,
-/// i.e. in the exact post-spawn state, and the peek remains non-consuming.
-///
-/// The name is unguessable (`wsecret-<pid>-<counter>`) and its only secret
-/// role is squatting resistance before the tighten; the empty DACL is what
-/// denies new opens. A NULL DACL (the plan's explicit anti-goal) would grant
-/// everyone.
-pub struct AgentPipe {
-    /// Read end (the child's inherited handle).
-    read: HANDLE,
-    /// Write end; closed by the launcher as soon as the child exists.
-    write: HANDLE,
-}
-
-impl AgentPipe {
-    /// Creates the pipe for the agent handoff (plan §5.2 step 5): both
-    /// handles non-inheritable, empty DACL in force before this returns.
-    /// See the type docs for the probe-verified named-pipe realization.
-    pub fn create() -> Result<AgentPipe, Error> {
-        // Zero-ACE ACL: just the ACL header (`InitializeAcl` writes a valid
-        // empty ACL; no ACE is ever added).
-        let mut acl = [0u8; 8];
-        // SAFETY: 8 bytes is exactly the ACL header; revision matches.
-        if unsafe { InitializeAcl(acl.as_mut_ptr() as *mut ACL, acl.len() as u32, ACL_REVISION) }
-            == 0
-        {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-
-        // Unique unguessable pipe name (squatter resistance before tighten).
-        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: process-id query, no preconditions.
-        let pid = unsafe { GetCurrentProcessId() };
-        let name_str = format!(r"\\.\pipe\wsecret-{pid}-{seq}");
-        let mut name: Vec<u16> = std::ffi::OsStr::new(&name_str)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        // Server end = write end, opened with PIPE_ACCESS_OUTBOUND | WRITE_DAC
-        // (probe: adding READ_CONTROL to dwOpenMode is ERROR_INVALID_PARAMETER).
-        const WRITE_DAC: u32 = 0x0004_0000;
-        let write = unsafe {
-            CreateNamedPipeW(
-                name.as_ptr(),
-                PIPE_ACCESS_OUTBOUND | WRITE_DAC,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,           // max instances
-                4096,        // out buffer (holds the 81-byte message)
-                4096,        // in buffer
-                0,           // default timeout
-                ptr::null(), // default security descriptor
-            )
-        };
-        if write == INVALID_HANDLE_VALUE {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-
-        // Client end = read end, opened through the DEFAULT descriptor while
-        // the name is known only to this process (pre-tighten window).
-        let read = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                ptr::null_mut(),
-            )
-        };
-        if read == INVALID_HANDLE_VALUE {
-            let e = io::Error::last_os_error();
-            unsafe { CloseHandle(write) };
-            return Err(Error::Io(e));
-        }
-
-        // Tighten: replace the DACL with the PROPER EMPTY DACL (probe:
-        // SetSecurityInfo returns 0 via the WRITE_DAC handle; a fresh open of
-        // the name afterwards is denied even for the creator).
-        // SAFETY: `acl` is the just-initialized zero-ACE ACL; `write` holds
-        // WRITE_DAC by construction above.
-        let status = unsafe {
-            SetSecurityInfo(
-                write,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                acl.as_ptr() as *const ACL,
-                ptr::null(),
-            )
-        };
-        if status != 0 {
-            let e = io::Error::from_raw_os_error(status as i32);
-            unsafe {
-                CloseHandle(write);
-                CloseHandle(read);
-            }
-            return Err(Error::Io(e));
-        }
-        // The name has served its purpose; scrub the local copy.
-        for c in &mut name {
-            *c = 0;
-        }
-        Ok(AgentPipe { read, write })
-    }
-
-    fn write_exact(&self, msg: &[u8]) -> Result<(), Error> {
-        debug_assert_eq!(msg.len(), AGENT_MSG_LEN);
-        if msg.len() != AGENT_MSG_LEN {
-            return Err(Error::Agent(crate::error::AgentError::Unavailable));
-        }
-        let mut written: u32 = 0;
-        // SAFETY: `self.write` is a live pipe write handle owned by `self`;
-        // `msg` is valid for the requested length.
-        let ok = unsafe {
-            WriteFile(
-                self.write,
-                msg.as_ptr(),
-                msg.len() as u32,
-                &mut written,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 || written as usize != msg.len() {
-            return Err(Error::Agent(crate::error::AgentError::Unavailable));
-        }
-        Ok(())
-    }
-
-    /// Marks ONLY the read handle inheritable (plan §5.2 step 6); the write
-    /// handle stays non-inheritable and is never listed. Per the
-    /// `UpdateProcThreadAttribute` contract, handles passed through
-    /// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` must be marked inheritable — the
-    /// handle LIST itself is what guarantees "nothing else inherits".
-    pub fn mark_read_inheritable(&mut self) -> Result<(), Error> {
-        // SAFETY: `self.read` is a live pipe handle owned by `self`.
-        if unsafe { SetHandleInformation(self.read, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
-        {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        Ok(())
-    }
-
-    /// The read handle value (the number advertised as `SECRET_AGENT`).
-    pub fn handle_value(&self) -> usize {
-        self.read as usize
-    }
-
-    /// True when `handle` is an anonymous-pipe handle (plan §5.2 acquisition
-    /// step 4: `GetFileType == FILE_TYPE_PIPE`).
-    pub fn is_pipe_handle(handle: usize) -> bool {
-        // SAFETY: `GetFileType` only queries the caller-supplied handle
-        // value; it returns `FILE_TYPE_UNKNOWN` on an invalid handle.
-        unsafe { GetFileType(handle as HANDLE) == FILE_TYPE_PIPE }
-    }
-
-    /// Peeks the buffered agent message without consuming it and, on magic +
-    /// constant-time header match, adopts the key into a fresh session
-    /// (upstream `MSG_PEEK` semantics; plan §5.2 acquisition step 5). `Ok(None)`
-    /// on any mismatch (wrong length, wrong magic, header inequality) — the
-    /// caller falls back to the passphrase path. No message or key bytes
-    /// cross this signature (plan §3.4 N4).
-    pub fn peek_adopt(&self, expected_header: &Header) -> Result<Option<Session>, Error> {
-        match peek_key(self.read as usize, expected_header)? {
-            Some(key) => Ok(Some(session_from_key(expected_header, key)?)),
-            None => Ok(None),
-        }
-    }
-}
-
-impl Drop for AgentPipe {
-    fn drop(&mut self) {
-        // SAFETY: live handles owned by this value, closed exactly once
-        // (`spawn_trusted_child` consumes the pipe and lets this drop run
-        // right after `CreateProcessW`).
-        unsafe {
-            if !self.read.is_null() {
-                CloseHandle(self.read);
-            }
-            if !self.write.is_null() {
-                CloseHandle(self.write);
-            }
-        }
-        self.read = ptr::null_mut();
-        self.write = ptr::null_mut();
-    }
-}
-
-/// Core of the acquisition path (plan §5.2 steps 3–6), private: the peeked
-/// key never crosses this module's public surface (plan §3.4 N4 — no message
-/// or key bytes in any public signature). Peek does NOT consume:
-/// repeated/descendant use works, exactly like upstream's `recv(MSG_PEEK)`.
-fn peek_key(handle: usize, expected_header: &Header) -> Result<Option<[u8; 32]>, Error> {
-    let mut msg = SecretBytes::new(AGENT_MSG_LEN)?;
-    let mut bytes_read: u32 = 0;
-    let mut total_avail: u32 = 0;
-    // SAFETY: `handle` is a caller-supplied pipe handle; `msg` is a valid
-    // 81-byte buffer for the peek.
-    let ok = unsafe {
-        PeekNamedPipe(
-            handle as HANDLE,
-            msg.as_mut_slice().as_mut_ptr() as *mut _,
-            AGENT_MSG_LEN as u32,
-            &mut bytes_read,
-            &mut total_avail,
-            ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        // Unreadable/non-pipe handle: no agent (upstream: a recv that cannot
-        // deliver exactly the message is "no match").
-        msg.clear();
-        return Ok(None);
-    }
-    if bytes_read as usize != AGENT_MSG_LEN || total_avail as usize != AGENT_MSG_LEN {
-        msg.clear();
-        return Ok(None);
-    }
-    let magic_ok = libhydrogen_sys::equal(&msg.as_slice()[0..8], &AGENT_MAGIC);
-    let header_ok = libhydrogen_sys::equal(
-        &msg.as_slice()[AGENT_HEADER_OFF..AGENT_HEADER_OFF + HEADER_LEN],
-        &encode_header(expected_header),
-    );
-    if !magic_ok || !header_ok {
-        msg.clear();
-        return Ok(None);
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&msg.as_slice()[AGENT_KEY_OFF..AGENT_KEY_OFF + 32]);
-    msg.clear();
-    Ok(Some(key))
-}
-
-/// Acquisition entry for the CLI: pipe-type check (plan §5.2 step 4) plus
-/// [`peek_key`], then key adoption into a session marked
-/// [`UnlockEvidence::AgentAuthorized`] (upstream `pass_ok = match`). The raw
-/// handle value arrives from the `SECRET_AGENT` decimal; `Ok(None)` on any
-/// mismatch means "fall back to the passphrase path". No key bytes cross
-/// this signature (plan §3.4 N4).
-pub fn adopt_from_handle_value(
-    handle: usize,
-    expected_header: &Header,
-) -> Result<Option<Session>, Error> {
-    if handle == 0 || !AgentPipe::is_pipe_handle(handle) {
-        return Ok(None);
-    }
-    match peek_key(handle, expected_header)? {
-        Some(key) => Ok(Some(session_from_key(expected_header, key)?)),
-        None => Ok(None),
-    }
-}
-
-/// Builds a fresh session from a header + adopted key, marked
-/// [`UnlockEvidence::AgentAuthorized`]. The caller's key copy is zeroized
-/// before returning on every path (internal to this module: the key never
-/// reaches a public signature, plan §3.4 N4).
-fn session_from_key(header: &Header, mut key: [u8; 32]) -> Result<Session, Error> {
-    let result = Session::from_parts(header.clone(), key);
-    libhydrogen_sys::memzero(&mut key);
-    let mut s = result?;
-    s.set_evidence(UnlockEvidence::AgentAuthorized);
-    Ok(s)
-}
-
-/// Strict unsigned-decimal parser for the `SECRET_AGENT` value (plan §5.2
-/// acquisition step 3): rejects signs, whitespace, trailing characters,
-/// empty strings, zero, and values that do not fit a pointer-sized `HANDLE`
-/// (upstream `strtol` semantics, tightened).
-pub fn parse_env_handle(value: &str) -> Option<usize> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n: u64 = value.parse().ok()?;
-    if n == 0 {
-        return None;
-    }
-    usize::try_from(n).ok()
-}
-
-/// Constant-time comparison of the two sessions' derived keys (the upstream
-/// `s_get_secret` retype check: `hydro_equal(&s.x.key, &check, ...)`). Key
-/// material stays inside transient secure buffers that are zeroized on every
-/// return path.
-pub fn sessions_same_key(a: &Session, b: &Session) -> Result<bool, Error> {
-    let mut ka = SecretBytes::new(32)?;
-    a.with_key(|k| ka.as_mut_slice().copy_from_slice(k))?;
-    let mut kb = SecretBytes::new(32)?;
-    b.with_key(|k| kb.as_mut_slice().copy_from_slice(k))?;
-    let same = libhydrogen_sys::equal(ka.as_slice(), kb.as_slice());
-    // `ka`/`kb` drop here: zeroized on every path.
-    Ok(same)
-}
 
 /// `ERROR_INVALID_NAME` (123): every policy rejection of a requested name
 /// (relative/current-dir, namespace/UNC, drive-relative, alternate data
@@ -800,7 +331,7 @@ pub fn resolve_executable(name: &std::ffi::OsStr) -> io::Result<std::ffi::OsStri
     Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND))
 }
 
-/// A spawned agent-shell child reduced to `SYNCHRONIZE |
+/// A spawned child process reduced to `SYNCHRONIZE |
 /// PROCESS_QUERY_LIMITED_INFORMATION` (plan §5.8 point 4: no full-access
 /// wsecret-child handle survives in the launcher). Waits and reads the exit
 /// status through the reduced handle only.
@@ -998,42 +529,17 @@ fn fold_case(w: &[u16]) -> Vec<u16> {
         .collect()
 }
 
-/// Spawns the trusted child (plan §5.2 steps 7–9 + §5.8 point 4), consuming
-/// the pipe: the launcher's own pipe handles are closed immediately after
-/// `CreateProcessW` (on failure too — the buffered message dies with the
-/// pipe), and the returned [`AgentChild`] holds ONLY a
-/// `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` duplicate of the child
-/// process handle — the full-access process and thread handles from
-/// `PROCESS_INFORMATION` are closed before returning.
-///
-/// The child inherits exactly the agent read handle and the deliberately
-/// duplicated std handles via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; the
-/// environment carries `SECRET_AGENT=<decimal handle>` and preserves
-/// everything else (including `SECRET_STORE`).
-pub fn spawn_trusted_child(
-    application: &std::ffi::OsStr,
-    argv: &[&std::ffi::OsStr],
-    pipe: AgentPipe,
-) -> Result<AgentChild, io::Error> {
-    let value = pipe.handle_value().to_string();
-    let env_block = build_env_block(&[EnvChange::Set(
-        std::ffi::OsStr::new(ENV_AGENT),
-        std::ffi::OsStr::new(&value),
-    )])?;
-    spawn_child_core(application, argv, env_block, Some(pipe))
-}
-
 /// Spawns the `wsecret ssh agent` child (WS-04): the child receives ONLY the
 /// deliberately duplicated ordinary standard handles plus `SSH_AUTH_SOCK`
 /// naming the VERIFIED Windows OpenSSH agent endpoint, passed verbatim as the
 /// complete pipe path (`\\.\pipe\openssh-ssh-agent` — Win32 OpenSSH clients
 /// hand the value to `CreateFileW` unchanged, openssh-portable
 /// `contrib/win32/win32compat/fileio.c:fileio_connect`, so it must never be
-/// shortened). The vault capability exists solely in `SECRET_AGENT` plus the
-/// inherited capability-pipe handle; this path creates NEITHER: no capability
-/// pipe exists here and any `SECRET_AGENT` entry is stripped from the
-/// inherited environment ("never `SECRET_AGENT` or vault capability"). Birth
-/// hardening and handle hygiene are identical to [`spawn_trusted_child`].
+/// shortened). No vault capability exists anywhere in this path: any legacy
+/// `SECRET_AGENT` entry is stripped from the inherited environment ("never
+/// `SECRET_AGENT` or vault capability"). Birth hardening and handle hygiene
+/// follow plan §5.8 point 4: the birth descriptors are verified and the
+/// launcher keeps only the reduced child handle.
 pub fn spawn_ssh_child(
     application: &std::ffi::OsStr,
     argv: &[&std::ffi::OsStr],
@@ -1043,19 +549,16 @@ pub fn spawn_ssh_child(
         EnvChange::Remove(std::ffi::OsStr::new(ENV_AGENT)),
         EnvChange::Set(std::ffi::OsStr::new(ENV_SSH_AUTH_SOCK), ssh_auth_sock),
     ])?;
-    spawn_child_core(application, argv, env_block, None)
+    spawn_child_core(application, argv, env_block)
 }
 
-/// Shared child-spawn body. `env_block` is the exact `CREATE_UNICODE_ENVIRONMENT`
-/// block and `pipe` is the trusted path's capability pipe (`None` for children
-/// that must inherit no wsecret handle at all). When present, the pipe is
-/// dropped immediately after `CreateProcessW` on every outcome (plan §5.2
-/// step 9).
+/// Shared child-spawn body. `env_block` is the exact
+/// `CREATE_UNICODE_ENVIRONMENT` block. The child inherits only the explicitly
+/// listed handles — the deliberately duplicated standard handles.
 fn spawn_child_core(
     application: &std::ffi::OsStr,
     argv: &[&std::ffi::OsStr],
     env_block: Vec<u16>,
-    pipe: Option<AgentPipe>,
 ) -> Result<AgentChild, io::Error> {
     // Command line: argv[0] as typed + arguments, properly quoted.
     let mut cmdline: Vec<u16> = Vec::new();
@@ -1116,17 +619,13 @@ fn spawn_child_core(
         std_dups.push(dup);
     }
 
-    // Only duplicated std handles and, on the trusted path, the capability
-    // pipe belong in the inheritance allowlist.
-    let mut inherit: Vec<HANDLE> = Vec::with_capacity(4);
+    // Only the duplicated std handles belong in the inheritance allowlist.
+    let mut inherit: Vec<HANDLE> = Vec::with_capacity(3);
     inherit.extend(std_dups.iter().copied().filter(|h| !h.is_null()));
     let use_std_handles = !inherit.is_empty();
-    if let Some(pipe) = &pipe {
-        inherit.push(pipe.read);
-    }
 
-    // Reserve one attribute slot in both paths. With nothing to inherit, keep
-    // the list initialized but omit HANDLE_LIST: a zero-length value is invalid.
+    // Reserve one attribute slot. With nothing to inherit, keep the list
+    // initialized but omit HANDLE_LIST: a zero-length value is invalid.
     let mut attr_size = 0;
     // SAFETY: documented sizing call; the first call fails by design.
     unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size) };
@@ -1201,9 +700,6 @@ fn spawn_child_core(
         )
     };
     let create_error = (created == 0).then(io::Error::last_os_error);
-    // Immediately close the launcher's pipe handles (plan §5.2 step 9): the
-    // child's inherited read handle keeps the buffered message alive.
-    drop(pipe);
     // SAFETY: the initialized list and its backing allocation are still live.
     unsafe { DeleteProcThreadAttributeList(attr_list) };
     drop(attr_buf);
@@ -1283,212 +779,6 @@ fn close_all(handles: &[HANDLE]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::OPS_LIMIT_MIN;
-
-    fn test_header() -> Header {
-        Header {
-            version: 0,
-            master: [7u8; 32],
-            ops_limit: OPS_LIMIT_MIN,
-        }
-    }
-
-    fn test_session() -> Session {
-        Session::from_parts(test_header(), [9u8; 32]).expect("session")
-    }
-
-    #[test]
-    fn message_is_exactly_81_bytes_with_explicit_layout() {
-        let mut session = test_session();
-        let cap = AgentCapability::from_session(&mut session).expect("capability");
-        let msg = cap.message();
-        assert_eq!(msg.len(), AGENT_MSG_LEN);
-        assert_eq!(AGENT_MSG_LEN, 81);
-        assert_eq!(&msg[0..8], b"WSECRET1");
-        // 41-byte upstream header, explicit encoding:
-        assert_eq!(msg[8], 0); // version
-        assert_eq!(&msg[9..41], &[7u8; 32][..]); // master
-        assert_eq!(&msg[41..49], &OPS_LIMIT_MIN.to_le_bytes()[..]); // ops_limit LE
-        assert_eq!(&msg[49..81], &[9u8; 32][..]); // key
-    }
-
-    #[test]
-    fn from_session_drains_the_source_session() {
-        let mut session = test_session();
-        assert!(!session.is_locked());
-        let cap = AgentCapability::from_session(&mut session).expect("capability");
-        assert!(session.is_locked());
-        // One-shot: a drained session cannot produce a second capability.
-        assert!(matches!(
-            AgentCapability::from_session(&mut session),
-            Err(Error::Locked)
-        ));
-        drop(cap);
-    }
-
-    #[test]
-    fn peek_matches_without_consuming() {
-        let pipe = AgentPipe::create().expect("pipe");
-        let mut session = test_session();
-        let cap = AgentCapability::from_session(&mut session).expect("cap");
-        let pipe = cap.write_to_pipe(pipe).expect("write");
-
-        let key = peek_key(pipe.handle_value(), &test_header())
-            .expect("peek")
-            .expect("match");
-        assert_eq!(&key[..], &[9u8; 32][..]);
-        // Peek does not consume: repeated/descendant use works (upstream
-        // MSG_PEEK semantics).
-        let again = peek_key(pipe.handle_value(), &test_header())
-            .expect("peek2")
-            .expect("match2");
-        assert_eq!(&again[..], &key[..]);
-        // The session-adopting facade returns a live session with that key.
-        let adopted = pipe
-            .peek_adopt(&test_header())
-            .expect("adopt")
-            .expect("adopt match");
-        assert!(!adopted.is_locked());
-    }
-
-    #[test]
-    fn peek_rejects_a_different_header() {
-        let pipe = AgentPipe::create().expect("pipe");
-        let mut session = test_session();
-        let cap = AgentCapability::from_session(&mut session).expect("cap");
-        let pipe = cap.write_to_pipe(pipe).expect("write");
-
-        let mut other = test_header();
-        other.master[1] ^= 0xff;
-        assert_eq!(peek_key(pipe.handle_value(), &other).expect("peek"), None);
-        assert!(pipe.peek_adopt(&other).expect("adopt").is_none());
-    }
-
-    #[test]
-    fn forged_message_with_wrong_magic_rejects() {
-        let pipe = AgentPipe::create().expect("pipe");
-        let mut forged = [0u8; AGENT_MSG_LEN];
-        forged[0..8].copy_from_slice(b"NOPE1234");
-        forged[AGENT_HEADER_OFF..AGENT_HEADER_OFF + HEADER_LEN]
-            .copy_from_slice(&encode_header(&test_header()));
-        assert!(pipe.write_exact(&forged).is_ok());
-        assert_eq!(
-            peek_key(pipe.handle_value(), &test_header()).expect("peek"),
-            None
-        );
-    }
-
-    #[test]
-    fn forged_message_is_narrowed_assurance() {
-        // Audit P13, documented end to end: a message carrying a correct
-        // header and an ATTACKER key is adopted (header equality is the only
-        // authorization), existing records stay unreadable, and NEW secrets
-        // get encrypted under the attacker key.
-        let pipe = AgentPipe::create().expect("pipe");
-        let real = test_header();
-        let mut forged = [0u8; AGENT_MSG_LEN];
-        forged[0..8].copy_from_slice(&AGENT_MAGIC);
-        forged[AGENT_HEADER_OFF..AGENT_HEADER_OFF + HEADER_LEN]
-            .copy_from_slice(&encode_header(&real));
-        forged[AGENT_KEY_OFF..AGENT_KEY_OFF + 32].copy_from_slice(&[0x41; 32]);
-        assert!(pipe.write_exact(&forged).is_ok());
-
-        let adopted = peek_key(pipe.handle_value(), &real)
-            .expect("peek")
-            .expect("header matched");
-        assert_eq!(&adopted[..], &[0x41; 32][..]); // attacker key adopted
-
-        let attacker = session_from_key(&real, adopted).expect("attacker session");
-        let victim = Session::from_parts(real.clone(), [9u8; 32]).expect("victim session");
-
-        // Existing records (encrypted under the victim key) fail
-        // authentication for the attacker session...
-        let mut victim_ct = [0u8; 512];
-        let mut plain = [0u8; 476];
-        plain[0..2].copy_from_slice(&3u16.to_le_bytes());
-        plain[2] = b'k';
-        plain[3] = 0;
-        plain[4..7].copy_from_slice(b"old");
-        victim
-            .with_key(|k| {
-                libhydrogen_sys::secretbox_encrypt(
-                    &mut victim_ct,
-                    &plain,
-                    &libhydrogen_sys::CTX_SECRET,
-                    k,
-                )
-            })
-            .expect("victim encrypt");
-        let mut out = [0u8; 476];
-        let decryptable = attacker
-            .with_key(|k| {
-                libhydrogen_sys::secretbox_decrypt(
-                    &mut out,
-                    &victim_ct,
-                    &libhydrogen_sys::CTX_SECRET,
-                    k,
-                )
-            })
-            .expect("attacker decrypt call");
-        assert!(!decryptable, "victim record must not authenticate");
-
-        // ...while NEW secrets are encrypted under the attacker key.
-        let mut attacker_ct = [0u8; 512];
-        attacker
-            .with_key(|k| {
-                libhydrogen_sys::secretbox_encrypt(
-                    &mut attacker_ct,
-                    &plain,
-                    &libhydrogen_sys::CTX_SECRET,
-                    k,
-                )
-            })
-            .expect("attacker encrypt");
-        assert_ne!(victim_ct, attacker_ct);
-        let mut out2 = [0u8; 476];
-        let ok = attacker
-            .with_key(|k| {
-                libhydrogen_sys::secretbox_decrypt(
-                    &mut out2,
-                    &attacker_ct,
-                    &libhydrogen_sys::CTX_SECRET,
-                    k,
-                )
-            })
-            .expect("attacker decrypt own record");
-        assert!(ok, "new records are readable only with the attacker key");
-    }
-
-    #[test]
-    fn teardown_zeroizes_the_message_buffer() {
-        let mut session = test_session();
-        let cap = AgentCapability::from_session(&mut session).expect("cap");
-        assert_eq!(cap.message().len(), AGENT_MSG_LEN);
-        // The zeroization mechanism (`SecretBytes::clear`, also run on drop):
-        let mut cap = cap;
-        cap.msg.clear();
-        assert!(cap.msg.as_slice().is_empty());
-        assert_eq!(cap.msg.len(), 0);
-        drop(cap);
-        // Session teardown: the source session is drained at capability
-        // creation and its at-rest key is erased on drop.
-        assert!(session.is_locked());
-    }
-    #[test]
-    fn sessions_same_key_compares_derived_keys() {
-        let a = Session::from_parts(test_header(), [1u8; 32]).expect("a");
-        let b = Session::from_parts(test_header(), [1u8; 32]).expect("b");
-        let c = Session::from_parts(test_header(), [2u8; 32]).expect("c");
-        assert!(sessions_same_key(&a, &b).expect("eq"));
-        assert!(!sessions_same_key(&a, &c).expect("ne"));
-    }
-
-    #[test]
-    fn pipe_type_check_distinguishes_pipes_from_files() {
-        assert!(!AgentPipe::is_pipe_handle(0));
-        let pipe = AgentPipe::create().expect("pipe");
-        assert!(AgentPipe::is_pipe_handle(pipe.handle_value()));
-    }
 
     #[test]
     fn quote_arg_matches_command_line_to_argvw_rules() {

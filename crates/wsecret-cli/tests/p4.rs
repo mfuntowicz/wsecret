@@ -3,6 +3,13 @@
 //! The default invocation runs the parent suite. Helper roles are separate
 //! processes of this same test binary, so watchdog poisoning/ExitProcess and
 //! fresh same-user OpenProcess/OpenThread checks never destabilize the parent.
+//!
+//! The P4d/P4h birth-descriptor scenario drives the MANAGED SSH launch path
+//! (`spawn_ssh_child`): the legacy capability transport (`AgentCapability` /
+//! `AgentPipe` / `SECRET_AGENT` handle passing) is gone and is NOT recreated
+//! here — only the launch-time handle hygiene and the child environment
+//! contract (verified `SSH_AUTH_SOCK`, legacy `SECRET_AGENT` stripped) are
+//! exercised.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, c_void};
@@ -26,10 +33,13 @@ use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Threading::*;
 use wsecret_core::format::Header;
 use wsecret_core::session::{Session, transient_key_address_for_test};
-use wsecret_core::windows::agent_bridge::{AgentCapability, AgentPipe, spawn_trusted_child};
+use wsecret_core::windows::agent_bridge::spawn_ssh_child;
 use wsecret_core::windows::security;
 
 const PASS: &[u8] = b"p4 acceptance passphrase";
+/// The one verified Windows OpenSSH agent endpoint (the managed SSH launch
+/// passes it verbatim as the child's `SSH_AUTH_SOCK`).
+const SSH_ENDPOINT: &str = r"\\.\pipe\openssh-ssh-agent";
 const OPS: u64 = 10_000;
 const PREREQUISITE_EXIT: i32 = 77;
 
@@ -655,7 +665,23 @@ fn role_overlapping_unlock(dir: &Path, _args: &[String]) -> Result<(), String> {
     }
 }
 
-fn role_agent_child(dir: &Path, _args: &[String]) -> Result<(), String> {
+/// Managed SSH child (`spawn_ssh_child` target): verifies its launch
+/// environment contract — `SSH_AUTH_SOCK` names the verified endpoint
+/// exactly and the legacy `SECRET_AGENT` variable is absent even though the
+/// launcher deliberately set one — then waits for the parent's stop signal.
+fn role_ssh_child(dir: &Path, _args: &[String]) -> Result<(), String> {
+    if let Some(value) = std::env::var_os("SECRET_AGENT") {
+        return Err(format!(
+            "legacy SECRET_AGENT leaked into the SSH child: {value:?}"
+        ));
+    }
+    let sock =
+        std::env::var_os("SSH_AUTH_SOCK").ok_or("SSH_AUTH_SOCK missing in the SSH child")?;
+    if sock != OsStr::new(SSH_ENDPOINT) {
+        return Err(format!(
+            "SSH_AUTH_SOCK is {sock:?}, want {SSH_ENDPOINT:?}"
+        ));
+    }
     wait_stop(dir)
 }
 
@@ -674,18 +700,25 @@ fn role_handle_table(_dir: &Path, args: &[String]) -> Result<(), String> {
     check_handle_table(launcher, process, thread, reduced, thread_type)
 }
 
-fn role_agent_launcher(dir: &Path, _args: &[String]) -> Result<(), String> {
+/// P4d/P4h launcher: the managed SSH launch (`spawn_ssh_child`) with the
+/// birth-descriptor and launcher handle-table probes. No capability
+/// transport exists here — the child receives only the duplicated ordinary
+/// standard handles and its sanitized environment.
+fn role_ssh_launcher(dir: &Path, _args: &[String]) -> Result<(), String> {
+    // A legacy capability variable in the launcher's own environment must
+    // never reach the managed SSH child: `spawn_ssh_child` strips it
+    // unconditionally (checked by the `ssh-child` role).
+    // SAFETY: set before `init()`/any worker thread exists in this helper.
+    unsafe {
+        std::env::set_var("SECRET_AGENT", "404");
+    }
     init()?;
-    let mut session = unlock()?;
-    let capability = AgentCapability::from_session(&mut session).map_err(|e| e.to_string())?;
-    let pipe = AgentPipe::create().map_err(|e| e.to_string())?;
-    let mut pipe = capability.write_to_pipe(pipe).map_err(|e| e.to_string())?;
-    pipe.mark_read_inheritable().map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let role = OsStr::new("--p4-role");
-    let child_role = OsStr::new("agent-child");
+    let child_role = OsStr::new("ssh-child");
     let argv: Vec<&OsStr> = vec![exe.as_os_str(), role, child_role, dir.as_os_str()];
-    let child = spawn_trusted_child(exe.as_os_str(), &argv, pipe).map_err(|e| e.to_string())?;
+    let child = spawn_ssh_child(exe.as_os_str(), &argv, OsStr::new(SSH_ENDPOINT))
+        .map_err(|e| e.to_string())?;
 
     let (original_process, original_thread, reduced) = child.handle_evidence_for_test();
     // OWNER_RIGHTS permits this limited fresh open; it identifies the thread
@@ -769,7 +802,7 @@ fn role_agent_launcher(dir: &Path, _args: &[String]) -> Result<(), String> {
     if code == 0 {
         Ok(())
     } else {
-        Err(format!("agent child exit {code}"))
+        Err(format!("ssh child exit {code}"))
     }
 }
 
@@ -1069,8 +1102,8 @@ fn run_parent() -> Result<(), String> {
     }
     println!("PASS P4f(c'''): independent monitor exits while main thread is in KDF");
 
-    let scenario = test_dir("agent-launcher");
-    let launcher = Running::start("agent-launcher", &scenario, &[])?;
+    let scenario = test_dir("ssh-launcher");
+    let launcher = Running::start("ssh-launcher", &scenario, &[])?;
     let ready = ready_map(&scenario)?;
     let child_pid = number(&ready, "child")? as u32;
     let child_tid = number(&ready, "tid")? as u32;
@@ -1095,7 +1128,7 @@ fn run_parent() -> Result<(), String> {
     write(&scenario.join("helpers-done"), b"done")?;
     wait_file(&scenario.join("local-done"), Duration::from_secs(10))?;
     assert_success(&launcher.stop()?).map_err(|e| format!("P4d/P4h launcher:\n{e}"))?;
-    println!("PASS P4d/P4h: birth protection + launcher handle-table hygiene");
+    println!("PASS P4d/P4h: managed SSH launch birth protection + launcher handle-table hygiene");
 
     // P4e/P4i/P4j: this parent deliberately remains an unhardened external
     // launcher and retains its full-access child handle.
@@ -1154,9 +1187,9 @@ fn role_main(role: &str, dir: &Path, args: &[String]) -> Result<(), String> {
         "residency" => role_residency(dir, args),
         "registered-host" => role_registered_host(dir, args),
         "overlapping-unlock" => role_overlapping_unlock(dir, args),
-        "agent-child" => role_agent_child(dir, args),
+        "ssh-child" => role_ssh_child(dir, args),
         "handle-table" => role_handle_table(dir, args),
-        "agent-launcher" => role_agent_launcher(dir, args),
+        "ssh-launcher" => role_ssh_launcher(dir, args),
         "memory-target" => role_memory_target(dir, args),
         "memory-attacker" => role_memory_attacker(dir, args),
         "watchdog-death" => role_watchdog_death(dir, args),

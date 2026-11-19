@@ -99,7 +99,7 @@ pub enum Status {
     MemoryProtection = 20,
     /// Filesystem cannot support the required semantics (21).
     UnsupportedFilesystem = 21,
-    /// Trusted-agent access unavailable (22).
+    /// SSH-agent access unavailable (22).
     AgentUnavailable = 22,
     /// Contained Rust panic (23).
     Panic = 23,
@@ -232,15 +232,16 @@ impl fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
-/// Trusted-agent failures (plan §3.4: `Agent` → `AGENT_UNAVAILABLE`).
+/// SSH-agent failures (`Agent` → `AGENT_UNAVAILABLE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentError {
-    /// `SECRET_AGENT` is present but not a valid transport descriptor.
+    /// The requested `SSH_AUTH_SOCK` endpoint is not the one supported local
+    /// endpoint.
     EnvParse,
-    /// Agent handshake failed (length/header mismatch); upstream falls back
-    /// to prompting in this case.
+    /// The ssh-agent wire exchange failed or the response does not match the
+    /// request framing (length/header mismatch).
     ProtocolMismatch,
-    /// No agent reachable at the advertised transport.
+    /// No ssh-agent reachable at the expected endpoint.
     Unavailable,
 }
 
@@ -327,7 +328,7 @@ impl std::error::Error for LimitExceeded {}
 /// The one error enum shared by the Rust API and the future C ABI (plan §3.4).
 #[derive(Debug)]
 pub enum Error {
-    /// I/O failure on the store file or console/agent transport.
+    /// I/O failure on the store file or console/ssh-agent transport.
     Io(std::io::Error),
     /// Store-format failure (see [`FormatError`]).
     Format(FormatError),
@@ -336,7 +337,7 @@ pub enum Error {
     /// Operation cancelled before completion (or after commit — see
     /// [`CommitReceipt::warnings`]).
     Cancelled,
-    /// Trusted-agent failure (see [`AgentError`]).
+    /// SSH-agent failure (see [`AgentError`]).
     Agent(AgentError),
     /// A configured resource limit was exceeded ([`LimitExceeded`] carries
     /// the diagnosis: which limit, the offending value, the numerical bound

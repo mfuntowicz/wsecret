@@ -43,18 +43,11 @@ use crate::windows::security::{self, ResidencyLease};
 pub enum UnlockEvidence {
     /// At least one record decrypted with this session key.
     MatchingRecords,
-    /// No record decrypted; creation/derive/agent-launch require
+    /// No record decrypted; creation/derive require
     /// `confirm_new_partition`.
     NoMatchingRecords,
     /// The user re-entered the passphrase to confirm a new partition.
     UserConfirmedNewPartition,
-    /// The 32-byte key was adopted from a trusted agent capability
-    /// (plan §5.2 acquisition, upstream `pass_ok = match` in `s_ask_agent`):
-    /// header equality alone authorizes creation/derive without the
-    /// no-records retype confirmation. The launching environment and the
-    /// inherited capability are TRUSTED INPUTS (audit P13 — see
-    /// `windows::agent_bridge` module docs).
-    AgentAuthorized,
 }
 
 /// An owned, zeroizing, native secret allocation (plan §5.3).
@@ -404,13 +397,11 @@ impl Session {
         })
     }
 
-    /// Builds a session from an already-derived key (internal: the agent
-    /// bridge's `adopt_from_pipe` path, which adopts the 73-byte
-    /// header + key blob). The key is wrapped in the at-rest protection
-    /// immediately; failure leaves no key material behind.
-    // Cross-slice contract surface: the agent-bridge slice (plan §5.2/§5.8)
-    // is this function's only caller and is not implemented yet.
-    #[allow(dead_code)]
+    /// Builds a session from an already-derived key (unit tests only: no
+    /// production path constructs a session from raw key bytes). The key is
+    /// wrapped in the at-rest protection immediately; failure leaves no key
+    /// material behind.
+    #[cfg(test)]
     pub(crate) fn from_parts(header: Header, key: [u8; 32]) -> Result<Session, Error> {
         let _acquisition = security::begin_secret_acquisition()?;
         let mut rest = SecretBytes::from_slice(&key)?;
@@ -550,6 +541,20 @@ impl Session {
         // `prev`/`cur` drop here: zeroized on every path.
         Ok(out)
     }
+}
+
+/// Constant-time comparison of the two sessions' derived keys (the upstream
+/// `s_get_secret` retype check: `hydro_equal(&s.x.key, &check, ...)`), used
+/// by the CLI/SSH passphrase-confirmation flows. Key material stays inside
+/// transient secure buffers that are zeroized on every return path.
+pub fn sessions_same_key(a: &Session, b: &Session) -> Result<bool, Error> {
+    let mut ka = SecretBytes::new(32)?;
+    a.with_key(|k| ka.as_mut_slice().copy_from_slice(k))?;
+    let mut kb = SecretBytes::new(32)?;
+    b.with_key(|k| kb.as_mut_slice().copy_from_slice(k))?;
+    let same = libhydrogen_sys::equal(ka.as_slice(), kb.as_slice());
+    // `ka`/`kb` drop here: zeroized on every path.
+    Ok(same)
 }
 
 #[cfg(test)]
@@ -724,6 +729,15 @@ mod tests {
             "at rest must be ciphertext"
         );
         s.with_key(|k| assert_eq!(k, &key)).expect("transient use");
+    }
+
+    #[test]
+    fn sessions_same_key_compares_derived_keys() {
+        let a = Session::from_parts(test_header(), [1u8; 32]).expect("a");
+        let b = Session::from_parts(test_header(), [1u8; 32]).expect("b");
+        let c = Session::from_parts(test_header(), [2u8; 32]).expect("c");
+        assert!(sessions_same_key(&a, &b).expect("eq"));
+        assert!(!sessions_same_key(&a, &c).expect("ne"));
     }
 
     #[test]

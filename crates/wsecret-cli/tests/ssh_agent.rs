@@ -8,8 +8,9 @@
 //! its own scenario directory; the RAII [`TestIdentity`] guard removes ONLY
 //! keys the test itself loaded (never `ssh-add -D`, never a foreign key).
 //! No test dumps the environment: [`vault_probe`] checks only three named
-//! variables and uses redirected `show help` to observe a synthetic record
-//! NAME, never its value or the SSH private key.
+//! variables and uses redirected `show help` to verify that record names are
+//! NEVER disclosed to the SSH child (no vault access, no values, no SSH
+//! private key).
 //! Prerequisites: the Windows OpenSSH Authentication Agent service running
 //! and verifiable, `openssl` on PATH, Windows PowerShell 5.1 present.
 
@@ -310,31 +311,24 @@ fn agent_count(public: &[u8; 32]) -> usize {
         .count()
 }
 
-/// Both agent children run exactly the same noninteractive completion. With
-/// redirected stdout, `show help` returns 255 and names under a capability;
-/// without one it must return 0 silently. It never needs a record value.
-/// A private console is NOT a no-prompt guarantee: bound the probe and its
-/// pipe drains, and kill only its own grandchild if a regression prompts.
-fn vault_probe(store: &Path, expected_marker: Option<&str>) -> String {
+/// The child-side vault-access probe (Windows PowerShell 5.1): the managed
+/// SSH child must hold NO vault access — the legacy `SECRET_AGENT` variable
+/// is absent (stripped by the managed launch), `SSH_AUTH_SOCK` names the
+/// exact verified endpoint, and the store is the expected one. The shared
+/// noninteractive completion (`show help` with redirected stdout) is the
+/// vault-access oracle: without a vault capability it completes silently
+/// with exit 0 and NEVER lists record names (the removed general-agent
+/// capability used to disclose them at exit 255; that path is gone and is
+/// not recreated). A private console is NOT a no-prompt guarantee: bound the
+/// probe and its pipe drains, and kill only its own grandchild if a
+/// regression prompts.
+fn vault_probe(store: &Path) -> String {
     let exe = ps_string(&harness::wsecret_exe().to_string_lossy());
     let store = ps_string(&store.to_string_lossy());
-    let (contract, status, names) = match expected_marker {
-        Some(marker) => (
-            "if($null -eq $env:SECRET_AGENT){ exit 10 }".to_owned(),
-            255,
-            format!("({} + [char]10)", ps_string(marker)),
-        ),
-        None => (
-            format!(
-                "if($null -ne $env:SECRET_AGENT){{ exit 10 }}; \
-                 if(-not [string]::Equals($env:SSH_AUTH_SOCK,'{SSH_ENDPOINT}',[StringComparison]::Ordinal)){{ exit 11 }}"
-            ),
-            0,
-            "''".to_owned(),
-        ),
-    };
     format!(
-        "$ErrorActionPreference='Stop'; {contract}; \
+        "$ErrorActionPreference='Stop'; \
+         if($null -ne $env:SECRET_AGENT){{ exit 10 }}; \
+         if(-not [string]::Equals($env:SSH_AUTH_SOCK,'{SSH_ENDPOINT}',[StringComparison]::Ordinal)){{ exit 11 }}; \
          if(-not [string]::Equals($env:SECRET_STORE,{store},[StringComparison]::Ordinal)){{ exit 12 }}; \
          $psi=[Diagnostics.ProcessStartInfo]::new({exe},'show help'); \
          $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true; \
@@ -344,8 +338,8 @@ fn vault_probe(store: &Path, expected_marker: Option<&str>) -> String {
            $stdout=$p.StandardOutput.ReadToEndAsync(); $stderr=$p.StandardError.ReadToEndAsync(); \
            if(-not $p.WaitForExit(10000)){{ exit 16 }}; \
            if(-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),2000)){{ exit 16 }}; \
-           if($p.ExitCode -ne {status}){{ exit 13 }}; \
-           if(-not [string]::Equals($stdout.Result,{names},[StringComparison]::Ordinal)){{ exit 14 }}; \
+           if($p.ExitCode -ne 0){{ exit 13 }}; \
+           if(-not [string]::Equals($stdout.Result,'',[StringComparison]::Ordinal)){{ exit 14 }}; \
            if($stderr.Result.Length -ne 0){{ exit 15 }} \
          }} finally {{ \
            if(-not $p.HasExited){{ $p.Kill(); $null=$p.WaitForExit(2000) }}; $p.Dispose() \
@@ -540,8 +534,9 @@ fn ssh_child_signs_through_the_verified_endpoint() {
 /// The child receives `SSH_AUTH_SOCK` (full verified agent path) and the
 /// expected store — but never `SECRET_AGENT` and no vault capability: the
 /// shared [`vault_probe`] verifies ONLY those contract points (no environment
-/// dump) and then requires silent, unauthorized name completion in the
-/// presence of a harmless same-partition marker.
+/// dump) and then requires the completion to stay silent and name-free in
+/// the presence of a record it must never disclose (the child cannot open
+/// the vault).
 #[test]
 fn ssh_child_receives_no_vault_access_or_capability() {
     let dir = scenario("no-vault");
@@ -558,7 +553,7 @@ fn ssh_child_receives_no_vault_access_or_capability() {
     );
     libhydrogen_sys::memzero(&mut secret);
 
-    let script = vault_probe(&store, None);
+    let script = vault_probe(&store);
     let console = ConsoleSession::new();
     let run = harness::run_wsecret(
         &console,
@@ -589,47 +584,10 @@ fn ssh_child_receives_no_vault_access_or_capability() {
     assert_eq!(owned.count(), 0, "identity remained after the SSH probe");
 }
 
-/// Positive control: the same completion must list exactly the marker name
-/// under the general agent's capability, without access to typed input.
+/// Identities that were in the shared Windows ssh-agent before the run must
+/// survive it untouched; only the key wsecret added is removed on exit.
 #[test]
-fn trusted_agent_child_reads_marker_without_reprompt() {
-    let dir = scenario("agent-marker");
-    let store = dir.join("store.secret");
-    let marker_name = format!("test/marker-{}", std::process::id());
-    create_store_with(&store, &[(marker_name.as_str(), b"unused by completion")]);
-
-    let script = vault_probe(&store, Some(&marker_name));
-    let console = ConsoleSession::new();
-    let run = harness::run_wsecret(
-        &console,
-        &store,
-        &[
-            "agent",
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ],
-        PASS,
-        None,
-        ChildStdout::CaptureFile(&dir.join("stdout.bin")),
-    );
-    assert_eq!(
-        run.code, VAULT_PROBE_OK,
-        "general-agent probe: 10 = SECRET_AGENT absent, 12 = SECRET_STORE, \
-         13 = completion status, 14 = wrong names, 15 = stderr, 16 = timeout"
-    );
-    assert!(
-        run.stdout.is_empty() && run.stderr.is_empty(),
-        "unexpected probe output"
-    );
-}
-
-/// Identities that were in the shared agent before the run must survive it
-/// untouched; only the key wsecret added is removed on exit.
-#[test]
-fn general_agent_identities_survive_the_ssh_agent_flow() {
+fn preexisting_bystander_identities_survive_the_ssh_agent_flow() {
     let dir = scenario("unaffected");
     let store = dir.join("store.secret");
     let key = format!("test/ssh-flow-{}", std::process::id());

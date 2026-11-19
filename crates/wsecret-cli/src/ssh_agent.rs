@@ -4,9 +4,9 @@
 //! 64-byte Ed25519 secret key in the encrypted store. `ssh agent` sends that
 //! key directly to the existing Windows OpenSSH agent over its named pipe,
 //! launches a trusted child with the verified `SSH_AUTH_SOCK` endpoint name
-//! and the ordinary standard handles — and nothing else: never `SECRET_AGENT`,
-//! never a vault capability — and removes the identity on every clean return
-//! path. The Windows agent performs all SSH signatures.
+//! and the ordinary standard handles — and nothing else: never a vault
+//! capability — and removes the identity on every clean return path. The
+//! Windows agent performs all SSH signatures.
 //!
 //! Coordination (WS-04): cooperating wsecret clients serialize per user and
 //! public key with [`IdentityLock`], held from before the agent listing
@@ -20,11 +20,11 @@ use std::path::Path;
 
 use wsecret_core::error::Error;
 use wsecret_core::store::{Limits, ScanOutcome, Store};
-use wsecret_core::windows::agent_bridge::{self, ENV_AGENT};
+use wsecret_core::windows::agent_bridge;
 use wsecret_core::windows::security::IdentityLock;
 use wsecret_core::windows::ssh_agent::{SshAgentClient, is_canonical_endpoint};
 
-use crate::agent::unlock_with_confirmation;
+use crate::unlock::{UnlockError, unlock_with_confirmation};
 use crate::output;
 
 /// Optional endpoint override. A nonempty value is accepted ONLY when it
@@ -37,7 +37,6 @@ pub const ENV_WSECRET_SSH_AGENT_PIPE: &str = "WSECRET_SSH_AGENT_PIPE";
 /// empty-input exit-0 case; every other variant renders `Fatal: …`.
 #[derive(Debug)]
 pub enum SshAgentError {
-    AlreadyRunning,
     MissingShell,
     SecretNotFound(Vec<u8>),
     InvalidKey,
@@ -72,7 +71,6 @@ pub enum SshAgentError {
 impl SshAgentError {
     pub fn message(&self) -> Option<String> {
         match self {
-            Self::AlreadyRunning => Some("Already running...".to_owned()),
             Self::MissingShell => Some("Missing env SHELL, nothing to exec!".to_owned()),
             Self::SecretNotFound(key) => {
                 Some(format!("Secret {} not found", String::from_utf8_lossy(key)))
@@ -141,7 +139,9 @@ pub fn public_key_line(public: &[u8; 32], key: &[u8]) -> Vec<u8> {
 ///
 /// The child receives ONLY the verified `SSH_AUTH_SOCK` endpoint name (the
 /// full agent path, preserved verbatim) and the ordinary standard handles —
-/// never `SECRET_AGENT` and never a vault capability (WS-04).
+/// never a vault capability (WS-04). The spawn bridge additionally strips the
+/// legacy `SECRET_AGENT` variable from the child environment; nothing in
+/// wsecret reads or sets it.
 ///
 /// Ordering (WS-04): the endpoint policy and [`agent_bridge::resolve_executable`]
 /// run BEFORE the vault is unlocked (a bad program name or untrusted endpoint
@@ -176,11 +176,6 @@ pub fn launch<F>(
 where
     F: FnMut(&str) -> std::io::Result<Vec<u8>>,
 {
-    // Refuse inside an agent zone (parity with `wsecret agent`).
-    if std::env::var_os(ENV_AGENT).is_some() {
-        return Err(SshAgentError::AlreadyRunning);
-    }
-
     // Endpoint policy (no custom trust): a nonempty override must name the
     // canonical Windows OpenSSH agent endpoint verbatim; anything else is
     // rejected before any I/O or unlock.
@@ -192,7 +187,7 @@ where
     }
 
     // The child's program and argv: the first `CMD` argument if given, else
-    // `$SHELL`, else `%ComSpec%` (upstream `wsecret agent` semantics).
+    // `$SHELL`, else `%ComSpec%` (upstream `s_agent` semantics).
     let shell_storage;
     let argv: Vec<&OsStr> = if !cmd.is_empty() {
         cmd.to_vec()
@@ -222,11 +217,11 @@ where
 
     let mut session = unlock_with_confirmation(&mut store, &header, &mut prompt).map_err(
         |error| match error {
-            crate::agent::AgentLaunchError::Cancelled => SshAgentError::Cancelled,
-            crate::agent::AgentLaunchError::Core(error) => SshAgentError::Core(error),
-            _other => SshAgentError::Core(Error::Agent(
-                wsecret_core::error::AgentError::ProtocolMismatch,
-            )),
+            UnlockError::Cancelled => SshAgentError::Cancelled,
+            // The upstream retype-mismatch catalog string ("Passphrases don't
+            // match!") renders through the normal error path.
+            UnlockError::PassphraseMismatch => SshAgentError::Core(Error::PassphraseMismatch),
+            UnlockError::Core(error) => SshAgentError::Core(error),
         },
     )?;
     let mut secret = match store
@@ -295,5 +290,84 @@ where
             launch: Box::new(error),
             cleanup,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wsecret_core::format::Header;
+    use wsecret_core::store::OPS_LIMIT_MAX;
+
+    /// A raw 512-byte header block with `ops_limit` above the ordinary
+    /// ceiling — written raw, since neither writing nor opening runs any KDF.
+    fn above_limit_header_store(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wsecret-ssh-agent-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, Header::encode_init([0x2a; 32], OPS_LIMIT_MAX + 1)).unwrap();
+        path
+    }
+
+    /// WS-06: the launcher's OWN open policy rejects an above-limit header
+    /// before any passphrase prompt and before the agent service is
+    /// contacted — `launch` resolves the program, then opens the store
+    /// (this rejection), and only then verifies the service and unlocks.
+    /// (`WSECRET_SSH_AGENT_PIPE` must be unset/empty in the test runner, or
+    /// the endpoint policy rejects first — as designed.)
+    #[test]
+    fn open_policy_rejects_an_above_limit_header_before_any_prompt() {
+        let path = above_limit_header_store("cap");
+        let mut prompts: Vec<String> = Vec::new();
+        let err = launch(
+            &path,
+            b"k",
+            &[OsStr::new("cmd.exe")],
+            Limits::default(),
+            |p| {
+                prompts.push(p.to_owned());
+                Ok(Vec::new())
+            },
+        )
+        .expect_err("the ordinary policy must reject the above-limit header");
+        let diagnosis = match err {
+            SshAgentError::Core(Error::ResourceLimit(diagnosis)) => diagnosis,
+            other => panic!("want Core(ResourceLimit), got {other:?}"),
+        };
+        assert_eq!(diagnosis.actual, OPS_LIMIT_MAX + 1);
+        assert_eq!(diagnosis.limit, OPS_LIMIT_MAX);
+        assert!(
+            prompts.is_empty(),
+            "no prompt may happen on an above-limit header: {prompts:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Store failures surface through the normal error path before any
+    /// prompt and before the agent service is contacted.
+    #[test]
+    fn store_errors_map_through_the_normal_error_path() {
+        let missing = std::env::temp_dir().join(format!(
+            "wsecret-ssh-agent-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut prompts: Vec<String> = Vec::new();
+        let err = launch(
+            &missing,
+            b"k",
+            &[OsStr::new("cmd.exe")],
+            Limits::default(),
+            |p| {
+                prompts.push(p.to_owned());
+                Ok(Vec::new())
+            },
+        )
+        .expect_err("missing store must fail");
+        assert!(matches!(err, SshAgentError::Core(Error::StoreNotFound)));
+        assert!(prompts.is_empty(), "no prompt before the store open: {prompts:?}");
     }
 }

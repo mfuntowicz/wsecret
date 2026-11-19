@@ -791,12 +791,31 @@ pub fn run_wsecret_lines(
     stdin: Option<&[u8]>,
     stdout: ChildStdout<'_>,
 ) -> Run {
+    run_wsecret_lines_env(session, store, args, lines, stdin, stdout, &[])
+}
+
+/// [`run_wsecret_lines`] with extra child-environment entries applied AFTER
+/// the built-in `SECRET_STORE` pin and `SECRET_AGENT` scrub. The fail-closed
+/// regressions use this to place a legacy `SECRET_AGENT` value in the child
+/// and prove it cannot bypass the ordinary unlock.
+pub fn run_wsecret_lines_env(
+    session: &ConsoleSession,
+    store: &Path,
+    args: &[&str],
+    lines: &[&str],
+    stdin: Option<&[u8]>,
+    stdout: ChildStdout<'_>,
+    extra_env: &[(&str, &OsStr)],
+) -> Run {
     let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     env.retain(|(k, _)| k != "SECRET_STORE" && k != "SECRET_AGENT");
     env.push((
         OsString::from("SECRET_STORE"),
         store.as_os_str().to_os_string(),
     ));
+    for (name, value) in extra_env {
+        env.push((OsString::from(name), value.to_os_string()));
+    }
     let env_block = env_block(&env);
 
     let (process, handles) = match stdout {
