@@ -1,0 +1,391 @@
+<Window
+    x:Class="WSecret.MainWindow"
+    x:Name="RootWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:vm="using:WSecret"
+    Title="WSecret — Quick Access">
+
+    <!-- ExtendsContentIntoTitleBar is set in the constructor: the XBF generator has no
+         schema for it on Window and fails WMC0612 (0x09C4 Property Not Found) if set here.
+         Window sizing lives in the constructor as well (580x400 DIP initial, 500x370 DIP
+         minimum enforced on AppWindow resize) for the same reason. -->
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <Grid x:Name="RootGrid" Background="{ThemeResource PaletteSurfaceBrush}">
+
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid.KeyboardAccelerators>
+            <KeyboardAccelerator Key="F" Modifiers="Control" Invoked="FocusSearch_Invoked" />
+            <KeyboardAccelerator Key="L" Modifiers="Control" Invoked="ToggleLock_Invoked" />
+            <KeyboardAccelerator Key="U" Modifiers="Control" Invoked="Unlock_Invoked" />
+            <KeyboardAccelerator Key="R" Modifiers="Control" Invoked="Refresh_Invoked" />
+            <KeyboardAccelerator Key="Number1" Modifiers="Control" Invoked="ShowDetails_Invoked" />
+            <KeyboardAccelerator Key="Number2" Modifiers="Control" Invoked="ShowCodes_Invoked" />
+            <KeyboardAccelerator Key="Number3" Modifiers="Control" Invoked="ShowEditor_Invoked" />
+        </Grid.KeyboardAccelerators>
+
+        <!-- ============ Title bar ============ -->
+        <!-- Interactive controls stop left of CaptionInset so the native caption
+             buttons are never covered; CaptionInset is a pure spacer. -->
+        <Grid Grid.Row="0" Height="42" ColumnSpacing="4" Padding="18,0,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Application mark + lowercase wordmark. -->
+            <Image Grid.Column="0" Source="ms-appx:///Assets/AppIcon.png" Width="20" Height="20" VerticalAlignment="Center" />
+            <TextBlock Grid.Column="1" Text="wsecret" FontSize="14" FontWeight="SemiBold"
+                       VerticalAlignment="Center" Margin="8,0,0,0" />
+
+            <!-- Drag region (interactive controls stay outside it). -->
+            <Grid x:Name="DragRegion" Grid.Column="2" Background="Transparent" />
+
+            <!-- Subdued settings / overflow (hide-to-tray is the window close / Escape). -->
+            <Button Grid.Column="3" x:Name="SettingsButton" Style="{StaticResource SubduedButtonStyle}"
+                    AutomationProperties.Name="Settings">
+                <FontIcon Glyph="&#xE713;" FontSize="14" />
+                <Button.Flyout>
+                    <Flyout>
+                        <StackPanel Width="340" Spacing="12">
+
+                            <TextBlock Text="Global hotkey" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <CheckBox x:Name="HotkeyCtrl" Content="Ctrl" />
+                                <CheckBox x:Name="HotkeyAlt" Content="Alt" />
+                                <CheckBox x:Name="HotkeyShift" Content="Shift" />
+                                <CheckBox x:Name="HotkeyWin" Content="Win" />
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <ComboBox x:Name="HotkeyKeyBox" MinWidth="90" AutomationProperties.Name="Hotkey key" />
+                                <Button Content="Apply hotkey" Click="ApplyHotkey_Click" />
+                            </StackPanel>
+                            <TextBlock x:Name="HotkeyErrorText" Text="{x:Bind VM.HotkeyErrorText, Mode=OneWay}"
+                                       Foreground="{ThemeResource StateBusyBrush}" TextWrapping="Wrap" />
+
+                            <TextBlock Text="Startup" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <ToggleSwitch x:Name="LaunchAtSignInSwitch" Header="Launch at sign-in" Toggled="LaunchAtSignIn_Toggled" />
+                            <ToggleSwitch x:Name="ClearClipboardSwitch" Header="Clear broker clipboard on lock" IsOn="True" Toggled="ClearClipboard_Toggled" />
+
+                            <TextBlock Text="Windows Hello" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind VM.HelloStateText, Mode=OneWay}" TextWrapping="Wrap" Foreground="{ThemeResource SubtleTextBrush}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="Enroll Hello" Command="{x:Bind VM.EnrollHelloCommand}" />
+                                <Button Content="Forget Hello" Command="{x:Bind VM.ForgetHelloCommand}" />
+                            </StackPanel>
+
+                            <TextBlock Text="Store" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <TextBlock x:Name="StorePathText" TextWrapping="Wrap" Foreground="{ThemeResource SubtleTextBrush}" />
+                            <TextBlock Text="{x:Bind VM.EntryCountText, Mode=OneWay}" TextWrapping="Wrap"
+                                       Foreground="{ThemeResource SubtleTextBrush}" />
+
+                        </StackPanel>
+                    </Flyout>
+                </Button.Flyout>
+            </Button>
+
+            <Button Grid.Column="4" Style="{StaticResource SubduedButtonStyle}"
+                    AutomationProperties.Name="More actions">
+                <FontIcon Glyph="&#xE712;" FontSize="14" />
+                <Button.Flyout>
+                    <MenuFlyout>
+                        <MenuFlyoutItem Text="Open item details" IsEnabled="{x:Bind VM.IsUnlocked, Mode=OneWay}" Click="OpenItem_Click" />
+                        <MenuFlyoutItem Text="Codes" IsEnabled="{x:Bind VM.IsUnlocked, Mode=OneWay}" Click="ShowCodes_Click" />
+                        <MenuFlyoutItem Text="Editor" IsEnabled="{x:Bind VM.IsUnlocked, Mode=OneWay}" Click="ShowEditor_Click" />
+                        <MenuFlyoutSeparator />
+                        <MenuFlyoutItem Text="{x:Bind VM.LockButtonLabel, Mode=OneWay}" Click="LockUnlock_Click" />
+                    </MenuFlyout>
+                </Button.Flyout>
+            </Button>
+
+            <!-- Caption-control reservation: width tracks AppWindow.TitleBar.RightInset
+                 (default 138 DIP = 3 x 46). Never interactive, never interactive content. -->
+            <Grid Grid.Column="5" x:Name="CaptionInset" Width="138" IsHitTestVisible="False" />
+        </Grid>
+
+        <!-- ============ Status banner ============ -->
+        <InfoBar Grid.Row="1" Margin="16,0"
+                 x:Name="ShellInfoBar"
+                 IsOpen="{x:Bind VM.ErrorOpen, Mode=OneWay}"
+                 Title="{x:Bind VM.ErrorTitle, Mode=OneWay}"
+                 Message="{x:Bind VM.ErrorText, Mode=OneWay}"
+                 IsClosable="True" Closed="ShellInfoBar_Closed"
+                 Severity="Error" />
+
+        <!-- ============ Content ============ -->
+        <!-- The pane container tracks VM.IsUnlocked; LockedHero is a sibling whose
+             visibility is applied in ApplyStateChrome (an x:Bind function binding
+             cannot raise notifications (WMC1506) in OneWay mode). -->
+        <Grid Grid.Row="2">
+            <Grid Visibility="{x:Bind VM.IsUnlocked, Mode=OneWay}">
+
+            <!-- Search: full-width leading-icon field + generous icon/title/breadcrumb rows. -->
+            <Grid x:Name="SearchPane" Margin="8,6,8,4" RowSpacing="16">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <!-- Pronounced full-width search with decorative leading magnifier.
+                     Focus uses the stock accent text-box chrome. -->
+                <Grid Grid.Row="0" Margin="9,0">
+                    <TextBox x:Name="SearchBox"
+                             PlaceholderText="Search secrets (Ctrl+F)"
+                             AutomationProperties.Name="Search secret names"
+                             TextChanging="SearchBox_TextChanging"
+                             FontSize="19" MinHeight="46"
+                             Padding="50,7,14,5"
+                             VerticalContentAlignment="Center"
+                             HorizontalAlignment="Stretch" />
+                    <FontIcon Glyph="&#xE721;" FontSize="20"
+                              HorizontalAlignment="Left" VerticalAlignment="Center"
+                              Margin="14,0,0,0" IsHitTestVisible="False"
+                              Foreground="{ThemeResource SubtleTextBrush}" />
+                    <Border Height="2" Margin="2,0" VerticalAlignment="Bottom" CornerRadius="1"
+                            Background="{ThemeResource AccentLineBrush}" IsHitTestVisible="False" />
+                </Grid>
+
+                <Grid Grid.Row="1">
+                    <ListView x:Name="ResultsList"
+                              ItemsSource="{x:Bind VM.Results, Mode=OneWay}"
+                              SelectionMode="Single"
+                              SelectionChanged="ResultsList_SelectionChanged"
+                              IsItemClickEnabled="False"
+                              IsDoubleTapEnabled="True"
+                              DoubleTapped="Result_DoubleTapped"
+                              AutomationProperties.Name="Search results">
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem" BasedOn="{StaticResource DefaultListViewItemStyle}">
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="vm:EntryItem">
+                                <!-- Full lossy path lives on DisplayName: exposed via tooltip
+                                     and the row's accessible name; the visible breadcrumb is
+                                     trimmed. -->
+                                <Grid Padding="8,8" MinHeight="60" ColumnSpacing="22"
+                                      ToolTipService.ToolTip="{x:Bind DisplayName}"
+                                      AutomationProperties.Name="{x:Bind DisplayName}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Viewbox Width="30" Height="30" VerticalAlignment="Center">
+                                        <PathIcon Data="{x:Bind CreateIcon()}" Style="{x:Bind IconStyle}" />
+                                    </Viewbox>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+                                        <TextBlock Text="{x:Bind Title}" FontSize="16" FontWeight="SemiBold"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{x:Bind Breadcrumb}" FontSize="14"
+                                                   Foreground="{ThemeResource SubtleTextBrush}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+
+                    <!-- Empty hint; visibility/content controlled by the shell controller. -->
+                    <TextBlock x:Name="EmptyResults" Text="No matching secrets."
+                               HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,24,0,0"
+                               Foreground="{ThemeResource SubtleTextBrush}"
+                               Visibility="Collapsed" />
+                </Grid>
+            </Grid>
+
+            <!-- Secondary tools: full-width, mutually exclusive with SearchPane
+                 (controller switches them), reachable back to search. -->
+            <Grid x:Name="SecondaryPane" Margin="16,8,16,8" RowSpacing="8" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <Grid Grid.Row="0" ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Button Grid.Column="0" Click="BackToSearch_Click" Style="{StaticResource SubduedButtonStyle}"
+                            AutomationProperties.Name="Back to search">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <FontIcon Glyph="&#xE72B;" FontSize="12" />
+                            <TextBlock Text="Search" />
+                        </StackPanel>
+                    </Button>
+                    <!-- Narrator live region: status changes are announced politely. -->
+                    <TextBlock Grid.Column="1" x:Name="StatusText" Text="{x:Bind VM.StatusText, Mode=OneWay}"
+                               VerticalAlignment="Center" Foreground="{ThemeResource SubtleTextBrush}"
+                               TextTrimming="CharacterEllipsis"
+                               AutomationProperties.LiveSetting="Polite" />
+                </Grid>
+
+                <SelectorBar x:Name="ViewSelector" Grid.Row="1" SelectionChanged="ViewSelector_SelectionChanged">
+                    <SelectorBarItem x:Name="DetailsTab" Text="Details" />
+                    <SelectorBarItem x:Name="CodesTab" Text="Codes" />
+                    <SelectorBarItem x:Name="EditorTab" Text="Editor" />
+                </SelectorBar>
+
+                <!-- Details (vertical scrolling keeps every action reachable at 500x370). -->
+                <Border x:Name="DetailsPanel" Grid.Row="2" Style="{StaticResource CardBorderStyle}">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="{x:Bind VM.SelectedDisplayName, Mode=OneWay}" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap" />
+                            <TextBlock Text="{x:Bind VM.SelectedMetaText, Mode=OneWay}" Foreground="{ThemeResource SubtleTextBrush}" TextWrapping="Wrap" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="Copy" Command="{x:Bind VM.CopyCommand}" AutomationProperties.Name="Copy the secret to the secure clipboard" />
+                                <!-- Secondary copy-code entry: same linked-code UX as the
+                                     footer (multi-target chooser, no VM.CopyCodeCommand). -->
+                                <Button x:Name="CopyCodeButton" Content="Copy code" Click="CodeAction_Click"
+                                        AutomationProperties.Name="Copy the current code to the secure clipboard" />
+                                <Button Content="Edit" Command="{x:Bind VM.EditCommand}" />
+                                <Button Content="Renew" Command="{x:Bind VM.RenewCommand}" />
+                                <Button Content="Tombstone" Command="{x:Bind VM.TombstoneCommand}" />
+                            </StackPanel>
+                            <TextBlock Text="Values and codes are never shown here; the broker copies them directly to the clipboard with an expiry."
+                                       Foreground="{ThemeResource SubtleTextBrush}" TextWrapping="Wrap" />
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+
+                <!-- Codes -->
+                <Border x:Name="CodesPanel" Grid.Row="2" Style="{StaticResource CardBorderStyle}" Visibility="Collapsed">
+                    <ListView x:Name="CodesList"
+                              ItemsSource="{x:Bind VM.Codes, Mode=OneWay}"
+                              AutomationProperties.Name="Authenticator codes">
+                        <ListView.ItemContainerStyle>
+                            <Style TargetType="ListViewItem" BasedOn="{StaticResource DefaultListViewItemStyle}">
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                            </Style>
+                        </ListView.ItemContainerStyle>
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="vm:CodeItem">
+                                <Grid Padding="4,8" ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                        <TextBlock Text="{x:Bind DisplayName}" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{x:Bind CountdownText}" FontSize="11" Foreground="{ThemeResource SubtleTextBrush}" />
+                                    </StackPanel>
+                                    <ProgressBar Grid.Column="1" Width="80" Minimum="0"
+                                                 Maximum="{x:Bind PeriodSeconds, Mode=OneWay}"
+                                                 Value="{x:Bind SecondsLeft, Mode=OneWay}"
+                                                 VerticalAlignment="Center" />
+                                    <Button Grid.Column="2" Click="CopyCode_Click" Content="Copy" AutomationProperties.Name="Copy the current code to the secure clipboard" />
+                                </Grid>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+                </Border>
+
+                <!-- Editor (vertical scrolling keeps every field usable at 500x370). -->
+                <Border x:Name="EditorPanel" Grid.Row="2" Style="{StaticResource CardBorderStyle}" Visibility="Collapsed">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel Spacing="12">
+                            <ComboBox x:Name="EditorActionBox" Header="Operation" ItemsSource="{x:Bind VM.EditorActionNames}" SelectionChanged="EditorActionBox_SelectionChanged" HorizontalAlignment="Stretch" />
+                            <TextBox x:Name="EditorNameBox" Header="Name" TextChanged="EditorNameBox_TextChanged" />
+                            <TextBox x:Name="EditorSubkeysBox" Header="Components — one per line (deterministic only)"
+                                     AcceptsReturn="True" TextWrapping="Wrap" MinHeight="64"
+                                     TextChanged="EditorSubkeysBox_TextChanged" />
+                            <TextBox x:Name="EditorNewNameBox" Header="New name (rename only)" TextChanged="EditorNewNameBox_TextChanged" />
+                            <TextBlock Text="Secret values and passphrases are typed into the broker's secure masked prompt — never into this window."
+                                       Foreground="{ThemeResource SubtleTextBrush}" TextWrapping="Wrap" />
+                            <Button Content="Apply" Style="{StaticResource AccentButtonStyle}" Command="{x:Bind VM.ApplyEditorCommand}" />
+                            <TextBlock Text="{x:Bind VM.EditorResultText, Mode=OneWay}" TextWrapping="Wrap" />
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+            </Grid>
+
+            <!-- ============ Locked hero ============ -->
+            <!-- Sibling of the pane container: it must stay visible while the
+                 panes are gated by VM.IsUnlocked. -->
+            <Grid x:Name="LockedHero" Margin="16,8,16,0" Visibility="Visible">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="12" MaxWidth="420">
+                    <Image Source="ms-appx:///Assets/AppIcon.png" Width="64" Height="64" HorizontalAlignment="Center" />
+                    <TextBlock Text="Vault locked" Style="{StaticResource TitleTextBlockStyle}" HorizontalAlignment="Center" />
+                    <TextBlock Text="Unlock to search, copy and manage secrets. Passphrases are entered in the broker's secure prompt — never in this window."
+                               TextWrapping="Wrap" TextAlignment="Center" Foreground="{ThemeResource SubtleTextBrush}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                        <Button Content="Unlock" Style="{StaticResource AccentButtonStyle}" Command="{x:Bind VM.UnlockCommand}" />
+                        <Button Content="Unlock with Hello" Command="{x:Bind VM.UnlockWithHelloCommand}" />
+                        <Button Content="Retry broker" Command="{x:Bind VM.RetryBrokerCommand}" />
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+        </Grid>
+
+        <!-- ============ Copy feedback (above the footer) ============ -->
+        <!-- One short sentence after a copy; visibility and text owned by the controller. -->
+        <TextBlock Grid.Row="3" x:Name="PaletteFeedback" Margin="16,2,16,0"
+                   TextTrimming="CharacterEllipsis"
+                   AutomationProperties.LiveSetting="Polite"
+                   Visibility="Collapsed" />
+
+        <!-- ============ Shortcut footer (search only) ============ -->
+        <!-- Clickable hint groups: keycap + action label. No Enter/Escape accelerators
+             here — the keyboard is handled by the shell controller. -->
+        <Border Grid.Row="4" x:Name="ShortcutFooter" Visibility="Collapsed"
+                BorderBrush="{ThemeResource CardBorderBrush}" BorderThickness="0,1,0,0"
+                Padding="12,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Button x:Name="PrimaryAction" Click="PrimaryAction_Click" Style="{StaticResource SubduedButtonStyle}"
+                        AutomationProperties.Name="Copy the selected password or code to the secure clipboard">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Border Style="{StaticResource ShortcutKeyStyle}">
+                            <TextBlock Text="Enter" />
+                        </Border>
+                        <TextBlock x:Name="PrimaryActionLabel" Text="Copy password"
+                                   FontSize="13" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </Button>
+                <Button Grid.Column="1" HorizontalAlignment="Center" x:Name="CodeAction" Click="CodeAction_Click" Style="{StaticResource SubduedButtonStyle}"
+                        AutomationProperties.Name="Copy the current code to the secure clipboard">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Border Style="{StaticResource ShortcutKeyStyle}">
+                            <TextBlock Text="Ctrl+Enter" />
+                        </Border>
+                        <TextBlock Text="Copy code" FontSize="13" VerticalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </Button>
+                <Button Grid.Column="2" x:Name="OpenAction" Click="OpenItem_Click" Style="{StaticResource SubduedButtonStyle}"
+                        AutomationProperties.Name="Open details for the selected item">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Border Style="{StaticResource ShortcutKeyStyle}">
+                            <TextBlock Text="Ctrl+O" />
+                        </Border>
+                        <TextBlock Text="Open item" FontSize="13" VerticalAlignment="Center"
+                                   TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                </Button>
+            </Grid>
+        </Border>
+
+    </Grid>
+</Window>

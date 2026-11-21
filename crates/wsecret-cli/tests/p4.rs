@@ -560,42 +560,63 @@ fn role_residency(dir: &Path, _args: &[String]) -> Result<(), String> {
         }
     });
     let tid = tid_rx.recv().map_err(|e| e.to_string())?;
-    let start = Instant::now();
-    while !security::process_is_poisoned() && start.elapsed() < Duration::from_secs(3) {
-        std::thread::sleep(Duration::from_millis(10));
+
+    // An idle native thread is hardened, not treated as a reason to destroy
+    // the session. Active KDF/key-use poisoning is covered by residency_r2a.
+    std::thread::sleep(Duration::from_millis(600));
+    if security::process_is_poisoned() {
+        return Err("an idle thread poisoned the residency session".to_owned());
     }
-    if !security::process_is_poisoned() {
-        return Err("watchdog did not poison an unregistered residency thread".to_owned());
-    }
-    let detection = start.elapsed();
-    if detection > Duration::from_millis(600) {
-        return Err(format!(
-            "watchdog detection took {detection:?}, beyond the 250 ms poll bound plus scheduling tolerance"
-        ));
-    }
-    // Documented residual: the unregistered thread itself remains openable
-    // for context hijacking; detection/poison is the bounded mitigation.
-    // SAFETY: fresh open of that deliberately unhardened thread.
+    security::register_discovered_threads_for_session()
+        .map_err(|e| format!("idle thread registration failed: {e}"))?;
+    // SAFETY: the newly hardened thread must no longer be openable for
+    // context hijacking by an ordinary same-user caller.
     let residual = unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, tid) };
-    if residual.is_null() {
-        return Err(format!(
-            "unhardened residual thread open failed: {}",
-            unsafe { GetLastError() }
-        ));
+    if !residual.is_null() {
+        unsafe { CloseHandle(residual) };
+        return Err("idle thread was not hardened before registration".to_owned());
     }
-    unsafe {
-        CloseHandle(residual);
+    if session.is_locked() {
+        return Err("idle thread registration locked the session".to_owned());
     }
-    let lock_start = Instant::now();
-    while !session.is_locked() && lock_start.elapsed() < Duration::from_secs(3) {
+    session
+        .derive_chain(&[])
+        .map_err(|e| format!("operation after idle registration failed: {e}"))?;
+
+    write(&dir.join("ordinary-stop"), b"stop")?;
+    ordinary
+        .join()
+        .map_err(|_| "ordinary thread panicked".to_owned())?;
+    Ok(())
+}
+
+fn role_batch_drain(dir: &Path, _args: &[String]) -> Result<(), String> {
+    init()?;
+    let session = unlock()?;
+    let batch = security::begin_operation_batch()
+        .map_err(|e| format!("batch admission failed: {e}"))?;
+    let stop = dir.join("ordinary-stop");
+    let ordinary = std::thread::spawn(move || {
+        while !stop.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    // Drop well before the 250 ms watchdog poll: the closing snapshot must
+    // catch this thread synchronously instead of excusing it as idle later.
+    drop(batch);
+    if !security::process_is_poisoned() {
+        return Err("batch drain did not poison a mid-request thread".to_owned());
+    }
+    match security::register_discovered_threads_for_session() {
+        Err(wsecret_core::Error::MemoryProtection) => {}
+        other => return Err(format!("poisoned idle registration returned {other:?}")),
+    }
+    let start = Instant::now();
+    while !session.is_locked() && start.elapsed() < Duration::from_secs(3) {
         std::thread::sleep(Duration::from_millis(10));
     }
     if !session.is_locked() {
-        return Err("session was not auto-locked after drain".to_owned());
-    }
-    match session.derive_chain(&[]) {
-        Err(wsecret_core::Error::MemoryProtection) => {}
-        other => return Err(format!("poisoned operation returned {other:?}")),
+        return Err("session was not cleared after batch-drain poison".to_owned());
     }
     write(&dir.join("ordinary-stop"), b"stop")?;
     ordinary
@@ -663,6 +684,29 @@ fn role_overlapping_unlock(dir: &Path, _args: &[String]) -> Result<(), String> {
             session_outcome(&other)
         )),
     }
+}
+
+fn role_watchdog_restart(_dir: &Path, _args: &[String]) -> Result<(), String> {
+    init()?;
+    for generation in 0..16 {
+        let mut session = unlock().map_err(|e| format!("generation {generation}: {e}"))?;
+        if security::process_is_poisoned() || session.is_locked() {
+            return Err(format!("generation {generation} started poisoned"));
+        }
+        session.lock();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while security::residency_snapshot_for_test().4 {
+            if Instant::now() >= deadline {
+                return Err(format!("generation {generation} watchdog did not stop"));
+            }
+            std::thread::yield_now();
+        }
+        // The next unlock must join the retired pair before admission; the
+        // stop flag is set while their trampolines can still be returning.
+    }
+    let mut final_session = unlock().map_err(|e| format!("final unlock: {e}"))?;
+    final_session.lock();
+    Ok(())
 }
 
 /// Managed SSH child (`spawn_ssh_child` target): verifies its launch
@@ -1078,12 +1122,14 @@ fn run_parent() -> Result<(), String> {
     for (role, label) in [
         ("unhardened-operation", "P4f(b) unhardened host operation"),
         ("pre-unlock-admission", "P4f(c) pre-unlock admission"),
-        ("residency", "P4f(c') residency poison + drain auto-lock"),
+        ("residency", "P4f(c') idle residency thread hardening"),
+        ("batch-drain", "P4f(c'') batch-drain residual-thread poison"),
         ("registered-host", "P4f(d) hardened registered host thread"),
         (
             "overlapping-unlock",
             "R2-A overlapping unlock drain/publication",
         ),
+        ("watchdog-restart", "R2-A watchdog stop/restart admission"),
     ] {
         let scenario = test_dir(role);
         let output = run_role(role, &scenario, &[])?;
@@ -1185,8 +1231,10 @@ fn role_main(role: &str, dir: &Path, args: &[String]) -> Result<(), String> {
         "unhardened-operation" => role_unhardened_operation(dir, args),
         "pre-unlock-admission" => role_pre_unlock_admission(dir, args),
         "residency" => role_residency(dir, args),
+        "batch-drain" => role_batch_drain(dir, args),
         "registered-host" => role_registered_host(dir, args),
         "overlapping-unlock" => role_overlapping_unlock(dir, args),
+        "watchdog-restart" => role_watchdog_restart(dir, args),
         "ssh-child" => role_ssh_child(dir, args),
         "handle-table" => role_handle_table(dir, args),
         "ssh-launcher" => role_ssh_launcher(dir, args),

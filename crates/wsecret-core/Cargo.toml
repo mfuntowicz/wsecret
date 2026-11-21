@@ -75,3 +75,12 @@ required-features = ["fault-injection"]
 name = "residency_r2a"
 harness = false
 required-features = ["fault-injection"]
+
+# Quick Access behavior projection (default-mapping, Codes, bounded
+# index/search, checked writes, store-size limit, writer mutex ACL): custom
+# harness for process isolation (like p4/residency_r2a) — the §5.8 boundary is
+# process-wide and the watchdog's poison is sticky, so every case runs in its
+# own protected ROLE process instead of sharing the libtest harness's threads.
+[[test]]
+name = "quick_access"
+harness = false

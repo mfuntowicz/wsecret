@@ -7,14 +7,17 @@
 //! startup hardening, `OWNER_RIGHTS`, hardened thread creation, unlock
 //! admission, and the continuous residency watchdog.
 
-use std::collections::HashSet;
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, HANDLE,
@@ -161,10 +164,14 @@ const MUTEX_ACL_LEN: usize = 8 + 2 * (8 + SECURITY_MAX_SID_SIZE as usize);
 
 // Request only the rights the DACL grants. CreateMutexW would request
 // MUTEX_ALL_ACCESS when a cooperating writer already has the mutex open.
-const MUTEX_ACCESS: u32 = SYNCHRONIZE | MUTEX_MODIFY_STATE;
+// READ_CONTROL is included on both sides so the post-acquire DACL /
+// effective-permission verification (below) can read the object's security
+// descriptor; it is a read-only right and widens nothing writable.
+const MUTEX_ACCESS: u32 = SYNCHRONIZE | MUTEX_MODIFY_STATE | READ_CONTROL;
 
-/// The user+SYSTEM `SYNCHRONIZE | MUTEX_MODIFY_STATE` DACL shared by the
-/// store writer mutex and the per-identity lock (spec §5.6 point 1; WS-03).
+/// The user+SYSTEM `SYNCHRONIZE | MUTEX_MODIFY_STATE | READ_CONTROL` DACL
+/// shared by the store writer mutex and the per-identity lock (spec §5.6
+/// point 1; WS-03).
 /// Every SID/ACL buffer is a [`AlignedBuf`] heap allocation whose address is
 /// stable while this value lives, and the descriptor is built against those
 /// final addresses, so [`MutexSecurity::attributes`] remains valid until
@@ -295,6 +302,102 @@ impl MutexSecurity {
     }
 }
 
+/// Validates the writer-mutex security contract on the ACQUIRED handle
+/// before any write may use the mutex ("validate the writer mutex ACL and
+/// effective permissions before enabling writes"):
+///
+/// - `CreateMutexExW` requests exactly [`MUTEX_ACCESS`], so a successful
+///   open proves those rights (and nothing more) were granted to us — the
+///   effective-permission side;
+/// - `GetSecurityInfo` succeeding proves `READ_CONTROL` was effectively
+///   granted through the object's DACL;
+/// - the DACL itself must be present, `SE_DACL_PROTECTED` (no inheritable
+///   grant merged in), and consist of EXACTLY the two allow ACEs this module
+///   creates (current user, then SYSTEM, each with exactly [`MUTEX_ACCESS`]).
+///
+/// A pre-existing named mutex (another writer, or a squatted
+/// `Global\wsecret-store-*` name created with a hostile DACL) is validated
+/// on EVERY acquisition, not just creation: the kernel ignores the caller's
+/// security attributes when the object already exists, so only read-back
+/// proves whose DACL is in force for the whole critical section (the ACL
+/// "lifetime" of the held mutex). Any deviation fails closed before writes.
+fn verify_mutex_security(handle: HANDLE) -> io::Result<()> {
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the output pointers are valid; the returned descriptor is
+    // freed below with LocalFree after all borrowed ACL pointers are done.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let result = (|| {
+        let mut present = 0;
+        let mut queried_dacl: *mut ACL = ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `sd` is the live self-relative descriptor returned above.
+        if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut queried_dacl, &mut defaulted) }
+            == 0
+            || present == 0
+            || queried_dacl.is_null()
+            || queried_dacl != dacl
+        {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: `sd` remains live; outputs are correctly typed.
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        let user = AlignedBuf::copy_of(&super::file::current_user_sid()?);
+        let system = well_known_sid(WinLocalSystemSid)?;
+        let expected = [user, system];
+        // SAFETY: the ACL header is part of the live returned descriptor.
+        if unsafe { (*dacl).AceCount } as usize != expected.len() {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        for (index, sid) in expected.iter().enumerate() {
+            let mut raw: *mut c_void = ptr::null_mut();
+            // SAFETY: index is bounded by AceCount checked above.
+            if unsafe { GetAce(dacl, index as u32, &mut raw) } == 0 || raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE share the prefix used
+            // here (Header, Mask, SidStart).
+            let ace = raw as *const ACCESS_ALLOWED_ACE;
+            // SAFETY: `ace` points to one complete standard access ACE.
+            if unsafe { (*ace).Header.AceType } != 0 /* ACCESS_ALLOWED_ACE_TYPE */
+                || unsafe { (*ace).Mask } != MUTEX_ACCESS
+            {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            // SAFETY: SidStart begins the variable-length SID in the ACE.
+            if unsafe { EqualSid(&(*ace).SidStart as *const u32 as PSID, sid.as_psid()) } == 0 {
+                return Err(io::Error::from_raw_os_error(5));
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: `sd` was allocated by GetSecurityInfo.
+    unsafe {
+        LocalFree(sd);
+    }
+    result
+}
+
 /// Held `Global\wsecret-store-<64 hex>` writer mutex (RAII release on drop).
 /// Windows mutex ownership is thread-bound: acquire and drop it on the same
 /// thread.
@@ -305,12 +408,17 @@ pub struct WriterMutex {
 }
 
 /// Creates/opens the named mutex `name` non-inheritably with the user+SYSTEM
-/// DACL and takes ownership with a zero-timeout wait. Returns
+/// DACL, validates the DACL/effective-permission contract on the acquired
+/// handle, and takes ownership with a zero-timeout wait. Returns
 /// `(handle, abandoned)`.
 ///
 /// Error contract (WS-03): [`Error::Busy`] ONLY on contention
 /// (`WAIT_TIMEOUT`); creation/open/wait failures preserve their OS error in
-/// [`Error::Io`] and are never reported as `Busy`.
+/// [`Error::Io`] and are never reported as `Busy`. A handle whose security
+/// descriptor fails [`verify_mutex_security`] is closed and reported as
+/// [`Error::MemoryProtection`] — writes stay disabled (fail closed). An
+/// older same-user writer whose DACL predates the `READ_CONTROL` grant also
+/// fails closed here (the open requests `READ_CONTROL`).
 fn acquire_mutex_handle(name: &str) -> Result<(HANDLE, bool), Error> {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let sec = mutex_security().map_err(Error::Io)?;
@@ -324,6 +432,17 @@ fn acquire_mutex_handle(name: &str) -> Result<(HANDLE, bool), Error> {
         // collision with a foreign object type, ...): the OS error is the
         // diagnosis. This is NOT contention.
         return Err(Error::Io(io::Error::last_os_error()));
+    }
+    // Writer-mutex ACL + effective-permission validation BEFORE this handle
+    // can gate any write. The kernel ignores `sa` when the named object
+    // pre-exists, so read-back is the only proof of whose DACL is in force.
+    if verify_mutex_security(handle).is_err() {
+        // SAFETY: owned handle; the security contract failed, so the object
+        // is unusable — close and fail closed before any write.
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(Error::MemoryProtection);
     }
     // SAFETY: fresh valid handle; zero timeout = non-blocking acquire.
     match unsafe { WaitForSingleObject(handle, 0) } {
@@ -794,6 +913,28 @@ fn duplicate_current_thread() -> io::Result<HANDLE> {
     Ok(handle)
 }
 
+fn duplicate_thread_for_registry(handle: HANDLE) -> io::Result<OwnedHandle> {
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: duplicates an existing thread handle within this process; the
+    // resulting handle is independently owned by the registry.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful DuplicateHandle transferred a fresh owned handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+}
+
 fn enumerate_threads() -> io::Result<Vec<u32>> {
     // SAFETY: snapshot query has no preconditions.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
@@ -846,10 +987,16 @@ fn thread_ids_in_snapshot(snapshot: &OwnedHandle) -> io::Result<Vec<u32>> {
     }
 }
 
-fn harden_thread_id(tid: u32) -> io::Result<()> {
+fn harden_thread_handle(tid: u32) -> io::Result<OwnedHandle> {
     // Thread IDs can be recycled between the system snapshot and OpenThread.
     let handle =
-        unsafe { OpenThread(WRITE_DAC | READ_CONTROL | THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
+        unsafe {
+            OpenThread(
+                SYNCHRONIZE | WRITE_DAC | READ_CONTROL | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                tid,
+            )
+        };
     if handle.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -858,11 +1005,63 @@ fn harden_thread_id(tid: u32) -> io::Result<()> {
     if unsafe { GetProcessIdOfThread(handle.as_raw_handle()) } != unsafe { GetCurrentProcessId() } {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
-    harden_object(handle.as_raw_handle(), ObjectKind::Thread)
+    harden_object(handle.as_raw_handle(), ObjectKind::Thread)?;
+    Ok(handle)
+}
+
+fn thread_is_live(handle: &OwnedHandle) -> io::Result<bool> {
+    // SAFETY: zero-timeout wait on an owned thread handle; WAIT_TIMEOUT means
+    // the kernel object is still live, WAIT_OBJECT_0 proves exit.
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_OBJECT_0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Checks an ID from a snapshot without treating an already-exited thread as
+/// an unregistered live thread. A missing/reused ID is ignored only when the
+/// kernel cannot open it or reports it exited.
+fn thread_id_is_live(tid: u32) -> io::Result<bool> {
+    let handle = unsafe { OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(87) {
+            // ERROR_INVALID_PARAMETER: the ID no longer names a live object.
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    // SAFETY: OpenThread returned an owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    thread_is_live(&handle)
+}
+
+/// Registers an owned, hardened thread handle. If the ID was recycled, the
+/// old kernel object must be proven exited before it can be replaced.
+fn register_thread_handle(tid: u32, handle: OwnedHandle) -> Result<u64, Error> {
+    let mut guard = state();
+    if let Some((_, existing)) = guard.threads.get(&tid) {
+        match thread_is_live(existing) {
+            Ok(true) => {} // duplicate registration of the same live thread
+            Ok(false) => {
+                guard.threads.remove(&tid);
+            }
+            Err(_) => return Err(Error::MemoryProtection),
+        }
+    }
+    guard.next_registration = guard.next_registration.wrapping_add(1);
+    let registration = guard.next_registration;
+    guard.threads.insert(tid, (registration, handle));
+    Ok(registration)
 }
 
 struct ProtectionState {
-    threads: HashSet<u32>,
+    /// Every registered thread has an owned kernel handle, so an exited ID
+    /// can be pruned positively without trusting numeric-ID reuse or a racy
+    /// snapshot of currently existing IDs.
+    threads: HashMap<u32, (u64, OwnedHandle)>,
+    next_registration: u64,
     sessions: Vec<Weak<crate::session::SessionKey>>,
     active_sessions: usize,
     pending_acquisitions: usize,
@@ -870,13 +1069,17 @@ struct ProtectionState {
     poisoned: bool,
     watchdog_running: bool,
     watchdog_id: Option<u32>,
+    /// Retired threads remain joinable so the next acquisition can wait for
+    /// their trampolines to unregister and exit before admission.
+    watchdog_threads: Option<(HardenedThread, HardenedThread)>,
     generation: u64,
 }
 
 impl ProtectionState {
     fn new() -> Self {
         Self {
-            threads: HashSet::new(),
+            threads: HashMap::new(),
+            next_registration: 0,
             sessions: Vec::new(),
             active_sessions: 0,
             pending_acquisitions: 0,
@@ -884,6 +1087,7 @@ impl ProtectionState {
             poisoned: false,
             watchdog_running: false,
             watchdog_id: None,
+            watchdog_threads: None,
             generation: 0,
         }
     }
@@ -895,8 +1099,25 @@ static INIT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static INIT: LazyLock<Result<(), u32>> =
     LazyLock::new(|| startup_hardening().map_err(|error| error.raw_os_error().unwrap_or(5) as u32));
 
+/// Makes thread discovery/registration and key-use admission mutually
+/// exclusive: a registration never interleaves with an admission snapshot or
+/// reservation, and no admission snapshot can observe a half-finished
+/// registration. Lock order: `ADMISSION` before the state mutex. The watchdog
+/// deliberately takes neither admission lock (it must keep heart-beating
+/// within the monitor bound); registration rejects active work, so detection
+/// never has a partial registration to observe. Never hold it while dropping
+/// an armed closing `OperationGuard`: its release takes this same lock via
+/// `close_operation_guard`.
+static ADMISSION: Mutex<()> = Mutex::new(());
+
 fn state() -> MutexGuard<'static, ProtectionState> {
     STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn admission() -> MutexGuard<'static, ()> {
+    ADMISSION
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -907,24 +1128,25 @@ fn startup_hardening() -> io::Result<()> {
     // Restrict the calling thread before spending time reading the process
     // descriptor back. Both descriptors must still verify before admission.
     let current = duplicate_current_thread()?;
-    let current_result = harden_object(current, ObjectKind::Thread);
-    // SAFETY: owned duplicate.
-    unsafe {
-        CloseHandle(current);
-    }
-    current_result?;
+    // SAFETY: `current` is an owned duplicate of the calling thread.
+    let current = unsafe { OwnedHandle::from_raw_handle(current) };
+    harden_object(current.as_raw_handle(), ObjectKind::Thread)?;
     verify_security(process, ObjectKind::Process)?;
 
     let current_id = unsafe { GetCurrentThreadId() };
     let threads = enumerate_threads()?;
+    let mut registrations = Vec::with_capacity(threads.len());
+    registrations.push((current_id, current));
     for &tid in &threads {
         if tid != current_id {
-            harden_thread_id(tid)?;
+            registrations.push((tid, harden_thread_handle(tid)?));
         }
     }
-    let mut guard = state();
-    guard.threads.clear();
-    guard.threads.extend(threads);
+    state().threads.clear();
+    for (tid, handle) in registrations {
+        register_thread_handle(tid, handle)
+            .map_err(|_| io::Error::other("thread registration failed"))?;
+    }
     Ok(())
 }
 
@@ -966,7 +1188,7 @@ fn ensure_current_registered() -> Result<(), Error> {
         return ensure_initialized();
     }
     let tid = unsafe { GetCurrentThreadId() };
-    if state().threads.contains(&tid) {
+    if state().threads.contains_key(&tid) {
         Ok(())
     } else {
         Err(Error::MemoryProtection)
@@ -978,23 +1200,53 @@ fn ensure_all_registered() -> Result<(), Error> {
         return ensure_initialized();
     }
     let threads = enumerate_threads().map_err(|_| Error::MemoryProtection)?;
-    let guard = state();
-    if threads.iter().all(|tid| guard.threads.contains(tid)) {
-        Ok(())
-    } else {
-        Err(Error::MemoryProtection)
+    let mut guard = state();
+    // Prune only kernel-confirmed exits. Snapshot absence is not evidence:
+    // a concurrent registration may postdate the snapshot, while a retained
+    // handle positively distinguishes a live object from a recycled ID.
+    let mut liveness_failed = false;
+    guard.threads.retain(|_, (_, handle)| match thread_is_live(handle) {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(_) => {
+            liveness_failed = true;
+            false
+        }
+    });
+    if liveness_failed {
+        return Err(Error::MemoryProtection);
     }
+    for &tid in &threads {
+        if guard.threads.contains_key(&tid) {
+            continue;
+        }
+        // A snapshot can include a thread that has already unregistered and
+        // exited. That is not an unregistered LIVE thread; prove exit before
+        // rejecting it, and fail closed on any live/unknown result.
+        if thread_id_is_live(tid).map_err(|_| Error::MemoryProtection)? {
+            return Err(Error::MemoryProtection);
+        }
+    }
+    Ok(())
 }
 
 /// A host-thread registration. Dropping it unregisters the calling thread;
 /// hosts must keep it alive until that thread exits.
 pub struct RegisteredThread {
     tid: u32,
+    registration: u64,
 }
 
 impl Drop for RegisteredThread {
     fn drop(&mut self) {
-        state().threads.remove(&self.tid);
+        let mut guard = state();
+        if guard
+            .threads
+            .get(&self.tid)
+            .is_some_and(|(registration, _)| *registration == self.registration)
+        {
+            guard.threads.remove(&self.tid);
+        }
     }
 }
 
@@ -1006,15 +1258,96 @@ pub fn register_hardened_thread() -> Result<RegisteredThread, Error> {
         return Err(Error::MemoryProtection);
     }
     let handle = duplicate_current_thread().map_err(|_| Error::MemoryProtection)?;
-    let result = harden_object(handle, ObjectKind::Thread);
-    // SAFETY: owned duplicate.
-    unsafe {
-        CloseHandle(handle);
-    }
-    result.map_err(|_| Error::MemoryProtection)?;
+    // SAFETY: `handle` is an owned duplicate of the calling thread.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    harden_object(handle.as_raw_handle(), ObjectKind::Thread)
+        .map_err(|_| Error::MemoryProtection)?;
     let tid = unsafe { GetCurrentThreadId() };
-    state().threads.insert(tid);
-    Ok(RegisteredThread { tid })
+    let registration = register_thread_handle(tid, handle)?;
+    Ok(RegisteredThread { tid, registration })
+}
+
+/// Hardens and registers threads created by native Windows libraries while
+/// the process is locked and quiescent. This is for explicit host native
+/// initialization (console/WebAuthn/COM), never for excusing a thread found
+/// during secret use: any live session, acquisition, operation, or poisoned
+/// state fails closed. A final snapshot ensures a thread created concurrently
+/// with registration is still rejected by the next admission check.
+pub fn register_discovered_threads() -> Result<(), Error> {
+    ensure_initialized()?;
+    if !initialized() {
+        return Err(Error::MemoryProtection);
+    }
+    // Registration and admission are mutually exclusive for the whole
+    // discovery: no admission snapshot can observe this registration halfway.
+    let _admission = admission();
+    retire_watchdog_for_discovery()?;
+    let threads = enumerate_threads().map_err(|_| Error::MemoryProtection)?;
+    let guard = state();
+    if guard.poisoned
+        || guard.active_sessions != 0
+        || guard.pending_acquisitions != 0
+        || guard.operations != 0
+    {
+        return Err(Error::MemoryProtection);
+    }
+    drop(guard);
+    for tid in threads {
+        if !state().threads.contains_key(&tid) {
+            match harden_thread_handle(tid) {
+                Ok(handle) => {
+                    register_thread_handle(tid, handle)?;
+                }
+                Err(_) if !thread_id_is_live(tid).map_err(|_| Error::MemoryProtection)? => {
+                    // A native thread exited between snapshot and open.
+                }
+                Err(_) => return Err(Error::MemoryProtection),
+            }
+        }
+    }
+    ensure_all_registered()
+}
+
+/// Hardens and registers threads created by native Windows libraries while a
+/// session is resident but the process sits between key-use requests: the
+/// quiescent gap a broker serve loop observes. Unlike
+/// [`register_discovered_threads`] this never retires or joins a running
+/// watchdog — key residency keeps it heart-beating — and it tolerates
+/// `active_sessions > 0`. It is ONLY for those quiescent gaps where no key
+/// use is in flight, never during key use: a poisoned state, an in-flight
+/// acquisition, or an in-flight key operation still fails closed, and a
+/// thread discovered while secrets are live is a poisoning condition for the
+/// watchdog, not a registration opportunity. A final `ensure_all_registered`
+/// ensures a thread created concurrently with registration is still rejected
+/// by the next admission check.
+pub fn register_discovered_threads_for_session() -> Result<(), Error> {
+    ensure_initialized()?;
+    if !initialized() {
+        return Err(Error::MemoryProtection);
+    }
+    // Same exclusion as `register_discovered_threads`: this discovery runs
+    // atomically with respect to every admission path.
+    let _admission = admission();
+    let threads = enumerate_threads().map_err(|_| Error::MemoryProtection)?;
+    let guard = state();
+    if guard.poisoned || guard.pending_acquisitions != 0 || guard.operations != 0 {
+        return Err(Error::MemoryProtection);
+    }
+    drop(guard);
+    for tid in threads {
+        if !state().threads.contains_key(&tid) {
+            match harden_thread_handle(tid) {
+                Ok(handle) => {
+                    register_thread_handle(tid, handle)?;
+                }
+                Err(_) if !thread_id_is_live(tid).map_err(|_| Error::MemoryProtection)? => {
+                    // A native thread exited between snapshot and open.
+                }
+                Err(_) => return Err(Error::MemoryProtection),
+            }
+        }
+    }
+    ensure_all_registered()
 }
 
 /// A thread born with the hardened descriptor. Closing the handle does not
@@ -1060,17 +1393,28 @@ impl Drop for HardenedThread {
     }
 }
 
-type ThreadJob = Box<dyn FnOnce() + Send + 'static>;
+struct ThreadJob {
+    job: Box<dyn FnOnce() + Send + 'static>,
+    registration: u64,
+}
 
 unsafe extern "system" fn hardened_thread_entry(parameter: *mut c_void) -> u32 {
     // SAFETY: CreateThread received exactly one Box<ThreadJob> pointer; the
     // trampoline takes ownership exactly once.
     let job = unsafe { Box::from_raw(parameter as *mut ThreadJob) };
     let tid = unsafe { GetCurrentThreadId() };
+    let registration = job.registration;
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        job();
+        (job.job)();
     }));
-    state().threads.remove(&tid);
+    let mut guard = state();
+    if guard
+        .threads
+        .get(&tid)
+        .is_some_and(|(token, _)| *token == registration)
+    {
+        guard.threads.remove(&tid);
+    }
     0
 }
 
@@ -1086,7 +1430,10 @@ where
     }
     let security = ObjectSecurity::new(ObjectKind::Thread).map_err(|_| Error::MemoryProtection)?;
     let attributes = security.attributes();
-    let raw_parameter = Box::into_raw(Box::new(Box::new(job) as ThreadJob)) as *mut c_void;
+    let raw_parameter = Box::into_raw(Box::new(ThreadJob {
+        job: Box::new(job),
+        registration: 0,
+    }));
     let mut tid = 0u32;
     let entry: LPTHREAD_START_ROUTINE = Some(hardened_thread_entry);
     // SAFETY: the job Box is kept alive until a running thread takes ownership;
@@ -1096,7 +1443,7 @@ where
             &attributes,
             0,
             entry,
-            raw_parameter,
+            raw_parameter.cast(),
             CREATE_SUSPENDED,
             &mut tid,
         )
@@ -1108,8 +1455,17 @@ where
         }
         return Err(Error::MemoryProtection);
     }
-    state().threads.insert(tid);
-    let prepared = verify_security(handle, ObjectKind::Thread);
+    let prepared = duplicate_thread_for_registry(handle)
+        .map_err(|_| Error::MemoryProtection)
+        .and_then(|registry| register_thread_handle(tid, registry))
+        .and_then(|registration| {
+            // SAFETY: the thread is still suspended, so its job cannot race
+            // this token write before the trampoline starts.
+            unsafe {
+                (*raw_parameter).registration = registration;
+            }
+            verify_security(handle, ObjectKind::Thread).map_err(|_| Error::MemoryProtection)
+        });
     if prepared.is_err() || unsafe { ResumeThread(handle) } == u32::MAX {
         // The thread is still suspended (or resume failed before execution).
         // SAFETY: owned full-access handle returned by CreateThread.
@@ -1192,7 +1548,7 @@ fn watchdog_loop(generation: u64, heartbeat: Arc<Heartbeat>) {
             return;
         }
 
-        {
+        let active_work = {
             let mut guard = state();
             if guard.generation != generation || !guard.watchdog_running {
                 return;
@@ -1203,11 +1559,19 @@ fn watchdog_loop(generation: u64, heartbeat: Arc<Heartbeat>) {
                 heartbeat.signal();
                 return;
             }
-        }
+            // Residual-thread detection covers active work only: a key-use
+            // operation or an in-flight acquisition/KDF. A thread appearing
+            // while the process is idle between requests is not a poisoning
+            // condition — the host serve loop hardens and registers it via
+            // `register_discovered_threads_for_session` in that quiescent gap,
+            // and admission (`begin_secret_acquisition`, `publish_session`)
+            // still fails closed on any unregistered thread.
+            guard.operations != 0 || guard.pending_acquisitions != 0
+        };
 
         // Five 50 ms heartbeat ticks make one 250 ms admission poll. Detection
         // is bounded by that poll; erasure additionally waits for real work.
-        if tick % 5 == 0 && ensure_all_registered().is_err() {
+        if active_work && tick % 5 == 0 && ensure_all_registered().is_err() {
             state().poisoned = true;
         }
 
@@ -1253,10 +1617,76 @@ fn monitor_loop(generation: u64, heartbeat: Arc<Heartbeat>) {
     }
 }
 
+/// Joins a stopped watchdog pair before a later admission snapshot. Their
+/// trampolines unregister just before returning to the OS; detaching these
+/// handles would let a lock/unlock restart observe those residual threads as
+/// unregistered and poison an otherwise clean epoch.
+fn retire_watchdog() -> Result<(), Error> {
+    let threads = {
+        let mut guard = state();
+        if guard.watchdog_running {
+            None
+        } else {
+            guard.watchdog_threads.take()
+        }
+    };
+    if let Some((watchdog, monitor)) = threads {
+        watchdog.join()?;
+        monitor.join()?;
+    }
+    Ok(())
+}
+
+/// Discovery while locked must retire a stopping watchdog before taking its
+/// snapshot. Wait for a quiescent stop, join the pair, and never race their
+/// final unregistration with native-thread discovery.
+fn retire_watchdog_for_discovery() -> Result<(), Error> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (running, threads) = {
+            let mut guard = state();
+            if guard.poisoned
+                || guard.active_sessions != 0
+                || guard.pending_acquisitions != 0
+                || guard.operations != 0
+            {
+                return Err(Error::MemoryProtection);
+            }
+            let running = guard.watchdog_running;
+            let threads = if running {
+                None
+            } else {
+                guard.watchdog_threads.take()
+            };
+            (running, threads)
+        };
+        if let Some((watchdog, monitor)) = threads {
+            watchdog.join()?;
+            monitor.join()?;
+            return Ok(());
+        }
+        if !running {
+            // This same locked observation proves there is no retained pair
+            // to join; never re-read `watchdog_running` for a second decision.
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::MemoryProtection);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn start_watchdog() -> Result<(), Error> {
     let _start = WATCHDOG_START
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The acquisition is already reserved by the caller. If the previous
+    // watchdog stopped between that reservation and this start, retire its
+    // handles now instead of overwriting them or admitting residual threads.
+    if !state().watchdog_running {
+        retire_watchdog()?;
+    }
     let generation = {
         let mut guard = state();
         if guard.watchdog_running {
@@ -1293,11 +1723,13 @@ fn start_watchdog() -> Result<(), Error> {
             return Err(error);
         }
     };
-    // Detach both handles. Their trampolines unregister themselves; the event
-    // remains alive through the closures' Arc references.
-    state().watchdog_id = Some(watchdog_id);
-    drop(watchdog);
-    drop(monitor);
+    // Keep both handles joinable for the next lock/unlock restart. Their
+    // trampolines unregister themselves; the event remains alive through the
+    // closures' Arc references.
+    let mut guard = state();
+    guard.watchdog_id = Some(watchdog_id);
+    debug_assert!(guard.watchdog_threads.is_none());
+    guard.watchdog_threads = Some((watchdog, monitor));
     Ok(())
 }
 
@@ -1310,9 +1742,22 @@ pub struct AcquisitionGuard {
 
 impl Drop for AcquisitionGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if !self.armed {
+            return;
+        }
+        // Mirror of `close_operation_guard` for the acquisition interval:
+        // `ADMISSION` excludes registration and every new admission, the
+        // reservation falls, and only then is the thread registry verified —
+        // so a thread created during a short KDF (even one appearing after
+        // `publish_session` returned) poisons here instead of escaping into
+        // the idle gap between watchdog polls.
+        let _admission = admission();
+        {
             let mut guard = state();
             guard.pending_acquisitions = guard.pending_acquisitions.saturating_sub(1);
+        }
+        if ensure_all_registered().is_err() {
+            state().poisoned = true;
         }
     }
 }
@@ -1324,7 +1769,11 @@ pub fn begin_secret_acquisition() -> Result<AcquisitionGuard, Error> {
         return Ok(AcquisitionGuard { armed: false });
     }
     ensure_current_registered()?;
-    ensure_all_registered()?;
+    // The admission lock covers the reservation through watchdog start, so no
+    // registration can interleave with this acquisition's admission snapshot.
+    let _admission = admission();
+    // Reserve the acquisition BEFORE retiring/admitting. The old watchdog
+    // can no longer stop between the admission snapshot and start_watchdog.
     {
         let mut guard = state();
         if guard.poisoned {
@@ -1332,7 +1781,12 @@ pub fn begin_secret_acquisition() -> Result<AcquisitionGuard, Error> {
         }
         guard.pending_acquisitions += 1;
     }
-    if let Err(error) = start_watchdog() {
+    let result = (|| {
+        retire_watchdog()?;
+        ensure_all_registered()?;
+        start_watchdog()
+    })();
+    if let Err(error) = result {
         let mut guard = state();
         guard.pending_acquisitions = guard.pending_acquisitions.saturating_sub(1);
         drop(guard);
@@ -1360,7 +1814,16 @@ impl Drop for ResidencyLease {
 pub(crate) fn publish_session(
     key: &Arc<crate::session::SessionKey>,
 ) -> Result<ResidencyLease, Error> {
-    ensure_all_registered()?;
+    // Publication and registration are mutually exclusive: the admission
+    // snapshot below cannot run halfway through a discovery.
+    let _admission = admission();
+    if ensure_all_registered().is_err() {
+        // Derived key material exists at publication time: a failed admission
+        // poisons the process so the watchdog drain clears this key and every
+        // existing session instead of leaving them resident.
+        state().poisoned = true;
+        return Err(Error::MemoryProtection);
+    }
     let mut guard = state();
     if guard.poisoned {
         return Err(Error::MemoryProtection);
@@ -1374,31 +1837,157 @@ pub(crate) fn publish_session(
 /// so its drop runs after the transient plaintext has been erased.
 pub(crate) struct OperationGuard {
     armed: bool,
+    /// True for a plain (non-batched) operation: its release closes with an
+    /// admission-held snapshot ([`close_operation_guard`]), covering the same
+    /// create→drain race the batch closing snapshot covers. A batched nested
+    /// operation is covered by its batch's closing drop and only decrements.
+    closing: bool,
+}
+
+/// Releases one counted key operation with the closing admission snapshot:
+/// `ADMISSION` excludes registration and every new admission, the operation
+/// count falls, and only then is the thread registry verified. The idle regime
+/// therefore starts AFTER the verification — a thread created before or during
+/// the operation and still live and unregistered poisons the process instead
+/// of escaping into the idle gap between watchdog polls, and one created after
+/// is caught by the next admission snapshot or the serve loop's registration.
+fn close_operation_guard() {
+    let _admission = admission();
+    {
+        let mut guard = state();
+        guard.operations = guard.operations.saturating_sub(1);
+    }
+    if ensure_all_registered().is_err() {
+        state().poisoned = true;
+    }
 }
 
 impl Drop for OperationGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if !self.armed {
+            return;
+        }
+        if self.closing {
+            close_operation_guard();
+        } else {
             let mut guard = state();
             guard.operations = guard.operations.saturating_sub(1);
         }
     }
 }
 
+thread_local! {
+    /// `OperationBatch` depth on this thread. Nonzero means one full
+    /// admission already covers every nested key-use operation of the request,
+    /// so those skip the per-operation ToolHelp snapshot while still counting.
+    static BATCH_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Admits one key-use operation. Once poisoned, every new operation fails with
 /// `MEMORY_PROTECTION`; already-running operations drain normally.
+///
+/// Outside an `OperationBatch` the caller gets a full admission: the
+/// `ADMISSION` lock excludes concurrent registration and `ensure_all_registered`
+/// rejects any live unregistered thread BEFORE the operation is counted, so a
+/// thread racing secret use fails closed without waiting for the watchdog; the
+/// guard's release closes with the matching snapshot (`close_operation_guard`).
+/// Inside a batch the batch's own admission covers the request and only the
+/// cheap per-thread and poison checks repeat; the batch's closing drop runs
+/// the one closing snapshot for the whole request.
 pub(crate) fn begin_key_operation() -> Result<OperationGuard, Error> {
     ensure_initialized()?;
     if !initialized() {
-        return Ok(OperationGuard { armed: false });
+        return Ok(OperationGuard {
+            armed: false,
+            closing: false,
+        });
     }
     ensure_current_registered()?;
+    if BATCH_DEPTH.with(|depth| depth.get() > 0) {
+        // Covered by the batch's admission: no snapshot, but the operation
+        // still counts, so registration stays rejected and the watchdog's
+        // active-work detection stays armed for the whole request. Release is
+        // a plain decrement; the batch's closing drop snapshots.
+        let mut guard = state();
+        if guard.poisoned {
+            return Err(Error::MemoryProtection);
+        }
+        guard.operations += 1;
+        return Ok(OperationGuard {
+            armed: true,
+            closing: false,
+        });
+    }
+    // Held across the snapshot AND the increment: registration can neither
+    // interleave with the snapshot nor slip in between snapshot and counting.
+    let _admission = admission();
+    ensure_all_registered()?;
     let mut guard = state();
     if guard.poisoned {
         return Err(Error::MemoryProtection);
     }
     guard.operations += 1;
-    Ok(OperationGuard { armed: true })
+    Ok(OperationGuard {
+        armed: true,
+        closing: true,
+    })
+}
+
+/// A whole-request key-use batch. Its single admission covers every nested
+/// `begin_key_operation` on the same thread (they skip the per-operation
+/// ToolHelp snapshot), while the held operation guard keeps `operations`
+/// nonzero for the entire request: registration is rejected throughout and the
+/// watchdog's active-work residual-thread detection stays armed. The drop of
+/// the LAST live batch closes the request with an admission-held closing
+/// snapshot, so a thread created after the batch's admission but never
+/// observed by a watchdog poll is caught at request end instead of escaping
+/// into the idle regime unnoticed. Not `Send` or `Sync`: batch depth is
+/// thread-local and the batch must drain on its own thread.
+pub struct OperationBatch {
+    /// Released at an exact point inside [`Drop::drop`]: `ManuallyDrop`
+    /// suppresses the automatic field drop so the operation count cannot fall
+    /// before the closing sequence decides it should.
+    _operation: ManuallyDrop<OperationGuard>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for OperationBatch {
+    fn drop(&mut self) {
+        // Peek before mutating: depth 1 means this drop takes the thread's
+        // last live batch to zero. Depth is thread-local and only this thread
+        // mutates it, so nothing can change it between peek and decrement.
+        let last = BATCH_DEPTH
+            .try_with(|depth| depth.get() <= 1)
+            // TLS gone at thread teardown: fail closed through the closing
+            // path rather than skip it.
+            .unwrap_or(true);
+        // Depth first: the closing helper runs after the decrement (this is
+        // thread-local bookkeeping; the security-relevant ordering lives
+        // inside `close_operation_guard`).
+        let _ = BATCH_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+        // Normalize the wrapped guard's release to the role this drop plays,
+        // so out-of-order nested drops cannot misroute it: the drop that takes
+        // depth to zero releases through `close_operation_guard` (admission-
+        // held closing snapshot), any earlier one only decrements.
+        self._operation.closing = last;
+        // SAFETY: `_operation` is owned by this batch and is released here
+        // exactly once; `ManuallyDrop` suppressed the automatic field drop.
+        unsafe { ManuallyDrop::drop(&mut self._operation) };
+    }
+}
+
+/// Starts a key-use batch covering one request (e.g. one broker List/Copy/Code
+/// dispatch). The full admission runs exactly once here; nested key operations
+/// on this thread are admitted by the batch until it is dropped, and the last
+/// drop closes the request with a closing snapshot. See [`OperationBatch`].
+pub fn begin_operation_batch() -> Result<OperationBatch, Error> {
+    // At batch depth 0 this is a full admission (snapshot under `ADMISSION`).
+    let operation = begin_key_operation()?;
+    BATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    Ok(OperationBatch {
+        _operation: ManuallyDrop::new(operation),
+        _not_send: PhantomData,
+    })
 }
 
 /// Whether the process-wide residual-thread detector has poisoned secret use.
@@ -1421,6 +2010,11 @@ pub fn residency_snapshot_for_test() -> (usize, usize, usize, bool, bool) {
         guard.poisoned,
         guard.watchdog_running,
     )
+}
+
+#[cfg(feature = "fault-injection")]
+pub fn operation_batch_depth_for_test() -> usize {
+    BATCH_DEPTH.with(|depth| depth.get())
 }
 
 /// Owns the process and thread descriptors supplied to CreateProcessW.
@@ -1548,5 +2142,112 @@ mod tests {
             .join()
             .unwrap();
         assert!(ok);
+    }
+
+    #[test]
+    fn session_gap_registration_fails_closed_without_process_protection() {
+        // The quiescent-gap registration API must never provide a silent
+        // unprotected fallback: a test process that never opted into the §5.8
+        // boundary (and any production caller before `init_process_protection`)
+        // gets MEMORY_PROTECTION. The fixture must stay uninitialized for this
+        // assertion to be meaningful; no other unit test may initialize the
+        // process-wide boundary in this binary (that belongs to role
+        // subprocesses).
+        assert!(!initialized());
+        assert!(matches!(
+            register_discovered_threads_for_session(),
+            Err(Error::MemoryProtection)
+        ));
+    }
+
+    #[test]
+    fn operation_batch_nests_and_drains_in_the_fixture_process() {
+        // Fixture processes without the §5.8 boundary admit unarmed batches;
+        // nesting must track depth and drain cleanly even when the batches are
+        // dropped out of stack order.
+        assert!(!initialized());
+        let outer = begin_operation_batch().expect("outer batch");
+        let inner = begin_operation_batch().expect("inner batch");
+        drop(outer);
+        drop(inner);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn operation_batch_depth_gates_the_admission_snapshot() {
+        assert!(!initialized());
+        assert_eq!(operation_batch_depth_for_test(), 0);
+        let outer = begin_operation_batch().expect("outer batch");
+        assert_eq!(operation_batch_depth_for_test(), 1);
+        {
+            let _inner = begin_operation_batch().expect("inner batch");
+            assert_eq!(operation_batch_depth_for_test(), 2);
+            // Nested operations skip the snapshot but still admit and count.
+            let _op = begin_key_operation().expect("nested operation");
+            assert_eq!(operation_batch_depth_for_test(), 2);
+        }
+        assert_eq!(operation_batch_depth_for_test(), 1);
+        drop(outer);
+        assert_eq!(operation_batch_depth_for_test(), 0);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn last_batch_drop_runs_the_closing_path_in_order() {
+        assert!(!initialized());
+        let outer = begin_operation_batch().expect("outer batch");
+        let inner = begin_operation_batch().expect("inner batch");
+        // Out-of-order drops: whichever drop takes depth to zero runs the
+        // admission-held closing sequence (depth decrement, operation-guard
+        // release, closing snapshot); the earlier one drains as a nested
+        // batch. Both drops must be safe in either order.
+        drop(outer);
+        assert_eq!(operation_batch_depth_for_test(), 1);
+        drop(inner);
+        assert_eq!(operation_batch_depth_for_test(), 0);
+        // In the fixture the closing snapshot is the uninitialized admission
+        // check; it must not poison (a real snapshot belongs to role
+        // subprocesses with `init_process_protection`).
+        assert!(!state().poisoned);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn armed_guard_releases_decrement_and_closing_snapshots() {
+        assert!(!initialized());
+        // Drive the armed release paths directly (fixture admissions return
+        // unarmed guards). This is the ONLY test that moves `operations`, so
+        // the count assertions stay exact under parallel test threads: the
+        // nested release decrements only, the closing release additionally
+        // runs `close_operation_guard` (whose snapshot is the uninitialized
+        // no-op admission check here and must not poison).
+        state().operations = 1;
+        drop(OperationGuard {
+            armed: true,
+            closing: false,
+        });
+        assert_eq!(residency_snapshot_for_test().2, 0);
+        state().operations = 1;
+        drop(OperationGuard {
+            armed: true,
+            closing: true,
+        });
+        assert_eq!(residency_snapshot_for_test().2, 0);
+        assert!(!state().poisoned);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn armed_acquisition_guard_release_drains_without_fixture_poison() {
+        assert!(!initialized());
+        // Synthetic armed acquisition guard (fixture admissions are unarmed):
+        // the release decrements `pending_acquisitions` and runs the closing
+        // drain, whose snapshot in the uninitialized fixture is the no-op
+        // admission check and must not poison. Only this test moves
+        // `pending_acquisitions`, so the count assertion is exact.
+        state().pending_acquisitions = 1;
+        drop(AcquisitionGuard { armed: true });
+        assert_eq!(residency_snapshot_for_test().1, 0);
+        assert!(!state().poisoned);
     }
 }

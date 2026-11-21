@@ -88,6 +88,61 @@ pub enum ScanMeta {
     },
 }
 
+/// Metadata of the record occupying one slot (spec §3.5 block address; the
+/// Quick Access identity is `slot` + exact `name` bytes). No value material
+/// is carried: `Debug` is safe to log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotMeta {
+    /// Byte offset of the record block (a multiple of 512, >= 512).
+    pub slot: u64,
+    /// The record name (metadata), exact bytes as stored.
+    pub name: Vec<u8>,
+    /// The record name carries the raw `DELETED:` tombstone prefix (lookup
+    /// parity).
+    pub tombstone: bool,
+}
+
+/// A slot-addressed record read ([`Store::read_at`]): metadata plus the
+/// record value in a zeroizing [`SecretBytes`] owner (erased on drop).
+#[derive(Debug)]
+pub struct SlotRecord {
+    /// The slot metadata.
+    pub meta: SlotMeta,
+    /// The record value: zeroizing owner. Borrow with
+    /// [`SecretBytes::as_slice`]; the plaintext never escapes as a `Vec`.
+    pub value: SecretBytes,
+}
+
+/// What a failed compare-and-set found instead of the expected record
+/// (pre-write report: the store is byte-unchanged on every mismatch).
+#[derive(Debug)]
+pub struct CasMismatch {
+    /// The record occupying the slot at compare time. `None` = no record of
+    /// this session is there (beyond EOF, a trailing partial block, or an
+    /// opaque other-partition block).
+    pub found: Option<SlotMeta>,
+    /// The name matched but the value differed (value-level CAS only).
+    pub value_changed: bool,
+}
+
+/// A failed [`Store::cas_slot`]: a content mismatch (always before write
+/// initiation, store byte-unchanged) or the write protocol's own failure
+/// (the §5.6 point 5 [`CommitFailure`] trichotomy is preserved unchanged).
+#[derive(Debug)]
+pub enum CasFailure {
+    /// The slot's content did not match the expectation; nothing written.
+    Mismatch(CasMismatch),
+    /// The write protocol reported a failure: pre-write rejections carry
+    /// [`CommitState::NotCommitted`], write-path failures their checkpoint
+    /// state.
+    Write(CommitFailure),
+}
+
+/// The `DELETED:` tombstone prefix check (lookup parity).
+fn is_tombstone(name: &[u8]) -> bool {
+    name.starts_with(b"DELETED:")
+}
+
 /// Internal result of [`Store::lookup`]: the caller's projection of a
 /// matched record, or the fixed not-found report.
 enum Lookup<T> {
@@ -103,18 +158,22 @@ enum Lookup<T> {
 ///
 /// The DEFAULT policy ([`Limits::default`], used by [`Store::open`],
 /// [`Store::open_read`] and every ordinary CLI/agent/SSH/future-import open)
-/// caps the header `ops_limit` at [`OPS_LIMIT_MAX`] (1_000_000) and leaves
-/// the store size uncapped. This is a deliberate, documented divergence from
-/// upstream, which accepts any `ops_limit >= 10000`: the pinned KDF loop
-/// cannot be interrupted, so a crafted header with `ops_limit = 2^64 - 1`
-/// pins a core ~forever (upstream hangs identically). Stores created
-/// upstream with `ops_limit > 1_000_000` still open — through the explicit
+/// caps the header `ops_limit` at [`OPS_LIMIT_MAX`] (1_000_000) and the store
+/// size at [`STORE_BYTES_MAX`] (64 MiB). Both are deliberate, documented
+/// divergences from upstream: the pinned KDF loop cannot be interrupted, so a
+/// crafted header with `ops_limit = 2^64 - 1` pins a core ~forever (upstream
+/// hangs identically), and a crafted store length forces store-sized
+/// allocations before anything else can run. Stores created upstream with
+/// `ops_limit > 1_000_000` still open — through the explicit
 /// [`Limits::allow_expensive_kdf`] override (CLI: `--allow-expensive-kdf` in
 /// the leading position before the command word, never inherited from the
-/// environment or from `agent`/`ssh agent` child arguments). The
-/// [`OPS_LIMIT_MIN`] format floor always applies and is never lifted.
+/// environment or from `agent`/`ssh agent` child arguments). Stores
+/// legitimately larger than [`STORE_BYTES_MAX`] open only through the
+/// explicit, per-open [`Limits::trusted_file`] override (one file, one open —
+/// never implicit, never inherited). The [`OPS_LIMIT_MIN`] format floor
+/// always applies and is never lifted.
 ///
-/// The cap is checked after the header/size inspection but before any KDF
+/// The caps are checked after the header/size inspection but before any KDF
 /// execution or store-sized allocation — i.e. before the open returns its
 /// handle — so no caller reaches an unbounded derivation or an expensive
 /// prompt by accident (plan §3.4 enforcement order).
@@ -133,6 +192,12 @@ pub struct Limits {
 /// `init`'s default is 100000 — and enforced by [`Limits::default`].
 pub const OPS_LIMIT_MAX: u64 = 1_000_000;
 
+/// Ordinary-open ceiling for the store size: 64 MiB (131072 record blocks
+/// plus the header — far beyond any legitimate store). Enforced by
+/// [`Limits::default`] before any store-sized allocation; raised only
+/// through the explicit per-open [`Limits::trusted_file`] override.
+pub const STORE_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
 impl Limits {
     /// The explicit expensive-KDF override (CLI `--allow-expensive-kdf`):
     /// the `ops_limit` ceiling is lifted, every other cap keeps its ordinary
@@ -141,6 +206,19 @@ impl Limits {
     pub fn allow_expensive_kdf() -> Limits {
         Limits {
             max_opslimit: None,
+            ..Limits::default()
+        }
+    }
+
+    /// The explicit, per-open trusted-file override: raises (or lifts with
+    /// `None`) the store-size ceiling for ONE open of a file the user has
+    /// explicitly trusted to be that large. Every other cap keeps its
+    /// ordinary value. Never implicit and never inherited from the
+    /// environment: the caller must receive it from an explicit user action
+    /// for this file (plan §3.4 limits policy).
+    pub fn trusted_file(max_store_bytes: Option<u64>) -> Limits {
+        Limits {
+            max_store_bytes,
             ..Limits::default()
         }
     }
@@ -167,11 +245,11 @@ impl Limits {
 
 impl Default for Limits {
     /// The ordinary-open policy: [`OPS_LIMIT_MAX`] ceiling on `ops_limit`,
-    /// no store-size ceiling.
+    /// [`STORE_BYTES_MAX`] ceiling on the store size.
     fn default() -> Self {
         Limits {
             max_opslimit: Some(OPS_LIMIT_MAX),
-            max_store_bytes: None,
+            max_store_bytes: Some(STORE_BYTES_MAX),
         }
     }
 }
@@ -541,7 +619,7 @@ impl Store {
                     kind: LimitKind::StoreBytes,
                     actual: len,
                     limit: max,
-                    remedy: LimitRemedy::CallerConfigured,
+                    remedy: LimitRemedy::TrustedFileOverride,
                 }));
             }
         }
@@ -604,19 +682,44 @@ impl Store {
         needle: Option<&[u8]>,
         on_name: &mut dyn FnMut(&[u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.scan_each_at(s, needle, &mut |_, name, _| {
+            on_name(name)?;
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    /// Slot-addressed streaming enumeration with early stop: like
+    /// [`Store::scan_each`], but `on_record` receives the record's slot
+    /// (byte offset) and tombstone flag and returns `Ok(false)` to stop the
+    /// scan early. The outer result is `Ok(true)` when the scan stopped
+    /// early (the caller's cap was hit) and `Ok(false)` when it ran to the
+    /// end — the bounded metadata scan behind the Quick Access index.
+    ///
+    /// Same visibility rules as [`Store::scan_each`]: blocks that do not
+    /// authenticate under the session are skipped silently (other
+    /// passphrase partitions stay invisible); a decryptable record that
+    /// fails structural validation aborts the scan with
+    /// [`FormatError::MalformedRecord`] (upstream `s_keylen` fatal parity).
+    pub fn scan_each_at(
+        &mut self,
+        s: &Session,
+        needle: Option<&[u8]>,
+        on_record: &mut dyn FnMut(u64, &[u8], bool) -> Result<bool, Error>,
+    ) -> Result<bool, Error> {
         let mut payload = [0u8; ENTRY_PLAIN_LEN];
-        let result = self.scan_each_inner(s, needle, on_name, &mut payload);
+        let result = self.scan_each_at_inner(s, needle, on_record, &mut payload);
         libhydrogen_sys::memzero(&mut payload);
         result
     }
 
-    fn scan_each_inner(
+    fn scan_each_at_inner(
         &mut self,
         s: &Session,
         needle: Option<&[u8]>,
-        on_name: &mut dyn FnMut(&[u8]) -> Result<(), Error>,
+        on_record: &mut dyn FnMut(u64, &[u8], bool) -> Result<bool, Error>,
         payload: &mut [u8; ENTRY_PLAIN_LEN],
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut block = [0u8; BLOCK];
         let mut offset = BLOCK as u64;
         // Fixed 512-byte read buffer; a short read is the tolerated trailing
@@ -629,12 +732,14 @@ impl Store {
                 // same way (errors carry no record bytes).
                 let entry = Entry::decode(payload).map_err(Error::from)?;
                 if needle.is_none_or(|n| ascii_contains(entry.name, n)) {
-                    on_name(entry.name)?;
+                    if !on_record(offset, entry.name, is_tombstone(entry.name))? {
+                        return Ok(true);
+                    }
                 }
             }
             offset += BLOCK as u64;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Materialized enumeration: the names of every record decryptable with
@@ -648,6 +753,83 @@ impl Store {
             Ok(())
         })?;
         Ok(names)
+    }
+
+    /// Slot-addressed metadata read (spec §3.5): decrypts ONLY the block at
+    /// `slot` (a multiple of 512, >= 512) and projects its metadata. The
+    /// record value never leaves the (zeroized) read buffer.
+    ///
+    /// - `Ok(Some(_))` — a record of this session occupies the slot;
+    /// - `Ok(None)` — no record of this session is there: beyond EOF, a
+    ///   trailing partial block, or a block that does not authenticate under
+    ///   this key (a record of ANOTHER passphrase partition stays opaque and
+    ///   unrevealed, exactly as in scans);
+    /// - [`FormatError::StoreLayout`] — `slot` is not a record block offset;
+    /// - [`FormatError::MalformedRecord`] — the block authenticated but
+    ///   fails structural validation (upstream `s_keylen` fatal parity).
+    ///
+    /// The identity callers must key on is `slot` + exact `name` bytes:
+    /// name-only lookup cannot distinguish duplicate names (upstream
+    /// first-match shadowing), which is why slot-addressed reads exist.
+    pub fn read_meta_at(&mut self, s: &Session, slot: u64) -> Result<Option<SlotMeta>, Error> {
+        let mut payload = [0u8; ENTRY_PLAIN_LEN];
+        let result = self.read_slot(s, slot, &mut payload, |entry| {
+            Ok(SlotMeta {
+                slot,
+                name: entry.name.to_vec(),
+                tombstone: is_tombstone(entry.name),
+            })
+        });
+        libhydrogen_sys::memzero(&mut payload);
+        result
+    }
+
+    /// Slot-addressed value read: [`Store::read_meta_at`] plus the record
+    /// value materialized exactly once into a zeroizing [`SecretBytes`]
+    /// owner. Same visibility rules — a foreign-partition slot yields
+    /// `Ok(None)` and never reveals another partition's bytes. Broker/CLI
+    /// code only: the value must never be relayed to an untrusted client.
+    pub fn read_at(&mut self, s: &Session, slot: u64) -> Result<Option<SlotRecord>, Error> {
+        let mut payload = [0u8; ENTRY_PLAIN_LEN];
+        let result = self.read_slot(s, slot, &mut payload, |entry| {
+            Ok(SlotRecord {
+                meta: SlotMeta {
+                    slot,
+                    name: entry.name.to_vec(),
+                    tombstone: is_tombstone(entry.name),
+                },
+                value: SecretBytes::from_slice(entry.value)?,
+            })
+        });
+        libhydrogen_sys::memzero(&mut payload);
+        result
+    }
+
+    /// Shared slot read behind [`Store::read_meta_at`] / [`Store::read_at`]:
+    /// `on_found` projects the decrypted record while the read buffer is
+    /// alive.
+    fn read_slot<T>(
+        &mut self,
+        s: &Session,
+        slot: u64,
+        payload: &mut [u8; ENTRY_PLAIN_LEN],
+        on_found: impl FnOnce(&Entry<'_>) -> Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        if slot % BLOCK as u64 != 0 || slot < BLOCK as u64 {
+            return Err(Error::Format(FormatError::StoreLayout));
+        }
+        let mut block = [0u8; BLOCK];
+        // A short read is the tolerated trailing partial block (spec §1.1):
+        // no complete record lives at this offset.
+        if !winfile::read_at(&self.file, slot, &mut block).map_err(io_err)? {
+            return Ok(None);
+        }
+        if !self.decrypt(s, &block, payload)? {
+            // Not our partition (or a damaged block): opaque, never revealed.
+            return Ok(None);
+        }
+        let entry = Entry::decode(payload).map_err(Error::from)?;
+        Ok(Some(on_found(&entry)?))
     }
 
     /// First-match lookup (upstream `s_get_secret`): exact case-sensitive
@@ -790,6 +972,197 @@ impl Store {
             None => winfile::file_len(&self.file)?,
         };
         self.mutate(offset, s, name, value)
+    }
+
+    /// Content compare-and-set write at `slot` (spec §5.6 write protocol
+    /// with a CAS gate): under the writer mutex and after §5.6 6b
+    /// revalidation, the record currently occupying `slot` must be exactly
+    /// `expect_name` and — when `expect_value` is given — its value must
+    /// match (constant-time). Only then are `new_name`/`new_value` written
+    /// in place: EXACTLY 512 bytes, one block, so other records and other
+    /// passphrase partitions are never read or rewritten. Every mismatch is
+    /// reported before write initiation with the store byte-unchanged
+    /// ([`CasFailure::Mismatch`]); the write path keeps the §5.6 point 5
+    /// [`CommitState`] trichotomy unchanged ([`CasFailure::Write`]).
+    ///
+    /// Mutations take the writer mutex automatically when the caller has
+    /// not already held it via [`Store::lock_writers`] — hold it across the
+    /// projection read + [`Store::cas_slot`] to span one critical section.
+    pub fn cas_slot(
+        &mut self,
+        slot: u64,
+        s: &Session,
+        expect_name: &[u8],
+        expect_value: Option<&[u8]>,
+        new_name: &[u8],
+        new_value: &[u8],
+    ) -> Result<CommitReceipt, CasFailure> {
+        let mut payload = build_entry_payload(new_name, new_value)
+            .map_err(|e| CasFailure::Write(CommitFailure::from(e)))?;
+        // §5.6 point 5 / §6 panic boundary (as `mutate`): a contained panic
+        // is reported as `(Error::Panic, phase)` — or, past checkpoint (iii),
+        // as the committed receipt plus warning bit 0.
+        let phase = Cell::new(CommitState::NotCommitted);
+        let warnings = Cell::new(0u32);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.cas_inner(
+                slot,
+                s,
+                expect_name,
+                expect_value,
+                &mut payload,
+                &phase,
+                &warnings,
+            )
+        }));
+        libhydrogen_sys::memzero(&mut payload);
+        match result {
+            Ok(outcome) => outcome,
+            Err(_) if phase.get() == CommitState::Committed => {
+                Ok(CommitReceipt::new(CommitState::Committed)
+                    .with_warning(warnings.get() | WARN_POST_COMMIT_PANIC))
+            }
+            Err(_) => Err(CasFailure::Write(CommitFailure::new(
+                Error::Panic,
+                phase.get(),
+            ))),
+        }
+    }
+
+    fn cas_inner(
+        &mut self,
+        slot: u64,
+        s: &Session,
+        expect_name: &[u8],
+        expect_value: Option<&[u8]>,
+        payload: &mut [u8; ENTRY_PLAIN_LEN],
+        phase: &Cell<CommitState>,
+        warnings: &Cell<u32>,
+    ) -> Result<CommitReceipt, CasFailure> {
+        // wsecret-writer serialization (spec §5.6 points 1-2): held across
+        // the compare AND the write (the mutex ACL/effective-permission
+        // validation runs inside `WriterMutex::acquire`, before any write).
+        let acquired_here = self.mutex.is_none();
+        if acquired_here {
+            let canonical = winfile::final_path(&self.file)
+                .map_err(|e| CasFailure::Write(CommitFailure::from(e)))?;
+            self.mutex = Some(
+                WriterMutex::acquire(&canonical)
+                    .map_err(|e| CasFailure::Write(CommitFailure::before_write(e)))?,
+            );
+        }
+        if self.mutex.as_ref().is_some_and(|m| m.abandoned) {
+            warnings.set(warnings.get() | WARN_ABANDONED_MUTEX);
+        }
+        let result =
+            self.cas_locked(slot, s, expect_name, expect_value, payload, phase, warnings);
+        self.release_if(acquired_here);
+        result
+    }
+
+    /// The CAS critical section with the writer mutex held: §5.6 6b
+    /// revalidation, in-place shape checks, content compare, encrypt, write.
+    fn cas_locked(
+        &mut self,
+        slot: u64,
+        s: &Session,
+        expect_name: &[u8],
+        expect_value: Option<&[u8]>,
+        payload: &mut [u8; ENTRY_PLAIN_LEN],
+        phase: &Cell<CommitState>,
+        warnings: &Cell<u32>,
+    ) -> Result<CommitReceipt, CasFailure> {
+        self.revalidate().map_err(CasFailure::Write)?;
+
+        // In-place shape rules (spec §3.5): the store length must be a
+        // multiple of 512 (stricter rejection of I/O-damaged input) and the
+        // target must be a complete record slot in [512, len] — a
+        // compare-and-set never appends. All rejections are pre-write.
+        let len = winfile::file_len(&self.file)
+            .map_err(|e| CasFailure::Write(CommitFailure::from(e)))?;
+        if len % BLOCK as u64 != 0
+            || len < BLOCK as u64
+            || slot % BLOCK as u64 != 0
+            || slot < BLOCK as u64
+            || slot + BLOCK as u64 > len
+        {
+            return Err(CasFailure::Write(CommitFailure::before_write(
+                Error::Format(FormatError::StoreLayout),
+            )));
+        }
+
+        // Content CAS under the mutex (the read gap closes here).
+        let mut current = [0u8; ENTRY_PLAIN_LEN];
+        let compare = self.cas_compare(s, slot, expect_name, expect_value, &mut current);
+        libhydrogen_sys::memzero(&mut current);
+        compare?;
+
+        let mut block = [0u8; BLOCK];
+        s.with_key(|key| {
+            libhydrogen_sys::secretbox_encrypt(
+                &mut block,
+                payload,
+                &libhydrogen_sys::CTX_SECRET,
+                key,
+            );
+        })
+        .map_err(|e| CasFailure::Write(CommitFailure::before_write(e)))?;
+
+        self.write_block(slot, &block, phase, warnings)
+            .map_err(CasFailure::Write)
+    }
+
+    /// The content-compare half of the CAS: reads and decrypts ONLY the
+    /// target block (the caller zeroizes `current`) and checks the name
+    /// (exact bytes) and the optional value (constant-time). A block that no
+    /// longer holds a record of this session reports `found: None`.
+    fn cas_compare(
+        &self,
+        s: &Session,
+        slot: u64,
+        expect_name: &[u8],
+        expect_value: Option<&[u8]>,
+        current: &mut [u8; ENTRY_PLAIN_LEN],
+    ) -> Result<(), CasFailure> {
+        let mut block = [0u8; BLOCK];
+        let occupied = if winfile::read_at(&self.file, slot, &mut block)
+            .map_err(|e| CasFailure::Write(CommitFailure::from(e)))?
+            && self
+                .decrypt(s, &block, current)
+                .map_err(|e| CasFailure::Write(CommitFailure::before_write(e)))?
+        {
+            let entry = Entry::decode(current)
+                .map_err(|f| CasFailure::Write(CommitFailure::before_write(Error::from(f))))?;
+            let meta = SlotMeta {
+                slot,
+                name: entry.name.to_vec(),
+                tombstone: is_tombstone(entry.name),
+            };
+            if entry.name != expect_name {
+                return Err(CasFailure::Mismatch(CasMismatch {
+                    found: Some(meta),
+                    value_changed: false,
+                }));
+            }
+            if let Some(expected) = expect_value {
+                if !libhydrogen_sys::equal(entry.value, expected) {
+                    return Err(CasFailure::Mismatch(CasMismatch {
+                        found: Some(meta),
+                        value_changed: true,
+                    }));
+                }
+            }
+            true
+        } else {
+            false
+        };
+        if !occupied {
+            return Err(CasFailure::Mismatch(CasMismatch {
+                found: None,
+                value_changed: false,
+            }));
+        }
+        Ok(())
     }
 
     fn mutate(
@@ -1480,7 +1853,7 @@ mod tests {
                 kind: LimitKind::StoreBytes,
                 actual: len,
                 limit: len - 1,
-                remedy: LimitRemedy::CallerConfigured,
+                remedy: LimitRemedy::TrustedFileOverride,
             }
         );
         let fit = Limits {

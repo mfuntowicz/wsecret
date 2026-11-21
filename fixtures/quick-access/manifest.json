@@ -1,0 +1,115 @@
+{
+  "schema": "wsecret.fixtures.quick-access/1",
+  "purpose": "Synthetic Quick Access fixture recipes and expected outcomes: exact-byte name mapping, Codes discovery, clipboard representability, partition isolation, and the performance corpus. Stores are generated at test time into a gitignored output directory; no ciphertext is committed here.",
+  "consumers": [
+    "scripts/test.ps1 (materializes the synthetic store and fills fixtures/quick-access/test-evidence.template.md)",
+    "scripts/bench.ps1 (materializes the perf corpus and fills fixtures/quick-access/bench-evidence.template.md)",
+    "the Quick Access acceptance tests (broker protocol / core quick module) referenced by those scripts"
+  ],
+  "upstream": {
+    "secret_commit": "e98103def4e062a6f9a8fa5e7693abe15f20817a",
+    "libhydrogen_commit": "6c58976b3b9178441218c12bca2cc414d9efe30d",
+    "format_version": 0,
+    "block_bytes": 512
+  },
+  "store_parameters": {
+    "ops_limit": 100000,
+    "note": "Matches fixtures/stores/manifest.json so CLI/core cross-checks reuse one KDF cost."
+  },
+  "passphrases": {
+    "P_A": { "label": "P_A", "utf8": "correct horse battery staple", "bytes_hex": "636f727265637420686f727365206261747465727920737461706c65" },
+    "P_B": { "label": "P_B", "utf8": "second", "bytes_hex": "7365636f6e64" }
+  },
+  "name_rules": {
+    "min_len": 1,
+    "max_len": 255,
+    "forbidden_bytes": "any byte <= 0x20 (upstream s_keylen)",
+    "value_max": "473 - name_len bytes (format.rs VALUE_MAX semantics)",
+    "identity": "exact raw name bytes plus physical slot; display strings are never identity"
+  },
+  "display_projection": {
+    "split": "ASCII slash 0x2F only; no filesystem normalization; dot segments and backslashes are data",
+    "root_rule": {
+      "n1": "one segment: item at the root of virtual vault 'Default (ungrouped)'",
+      "n2": "two segments: group = segment 0, item = segment 1, under 'Default (ungrouped)'",
+      "n3plus": "three or more segments: vault = segment 0, groups = middle segments, item = last segment, order preserved"
+    },
+    "named_default": "a literal first segment 'Default' renders as 'Default (named)'; the synthesized root renders as 'Default (ungrouped)'; both stay addressable",
+    "escaping": {
+      "printable_ascii": "bytes 0x21..0x7E render literally except backslash",
+      "backslash": "renders as two characters: backslash backslash",
+      "other_bytes": "every byte outside 0x21..0x7E renders as \\xNN (lowercase hex), including 0x7F..0xFF; literal marker text therefore cannot collide with the marker",
+      "empty_segment": "renders as the marker U+2300 (EMPTY SET SIGN); a data segment containing those UTF-8 bytes renders as escapes",
+      "bidi_controls": "bytes >= 0x80 are escaped, so RTL override bytes render as \\xNN"
+    },
+    "dual_nodes": "a name that is both a stored item and a container prefix exposes two distinct actions (own value, browse children); never merge them",
+    "duplicate_names": "exact duplicate raw names (reachable via rename without a uniqueness check) are individually discoverable by slot; the core's first-match lookup shadows later ones, so mutation/copy-by-guess is disabled unless the target slot is unambiguous"
+  },
+  "projection_cases": [
+    { "id": "P01", "name_hex": "746f6b656e", "name": "token", "partition": "P_A", "root": "Default (ungrouped)", "path": ["token"], "node": "item" },
+    { "id": "P02", "name_hex": "4769744875622f70617373776f7264", "name": "GitHub/password", "partition": "P_A", "root": "Default (ungrouped)", "path": ["GitHub", "password"], "node": "item" },
+    { "id": "P03", "name_hex": "576f726b2f4769744875622f70617373776f7264", "name": "Work/GitHub/password", "partition": "P_A", "root": "Work", "path": ["GitHub", "password"], "node": "item" },
+    { "id": "P04", "name_hex": "576f726b2f456e67696e656572696e672f506c6174666f726d2f4769744875622f6465706c6f792f70726f642f746f6b656e", "name": "Work/Engineering/Platform/GitHub/deploy/prod/token", "partition": "P_A", "root": "Work", "path": ["Engineering", "Platform", "GitHub", "deploy", "prod", "token"], "node": "item" },
+    { "id": "P05a", "name_hex": "576f726b2f4769744875622f6b6579", "name": "Work/GitHub/key", "partition": "P_A", "root": "Work", "path": ["GitHub", "key"], "node": "item+container", "notes": "dual node; sibling P05b supplies children" },
+    { "id": "P05b", "name_hex": "576f726b2f4769744875622f6b65792f7075626c6963", "name": "Work/GitHub/key/public", "partition": "P_A", "root": "Work", "path": ["GitHub", "key", "public"], "node": "item" },
+    { "id": "P06a", "name_hex": "44656661756c742f4769744875622f70617373776f7264", "name": "Default/GitHub/password", "partition": "P_A", "root": "Default (named)", "path": ["GitHub", "password"], "node": "item" },
+    { "id": "P06b", "name_hex": "4769744875622f70617373776f7264", "name": "GitHub/password", "partition": "P_A", "root": "Default (ungrouped)", "path": ["GitHub", "password"], "node": "item", "notes": "same display label as P02 scenario; distinct internal roots; with P06a present both remain addressable" },
+    { "id": "P07", "name_hex": "576f726b2f2f4769744875622f746f6b656e", "name": "Work//GitHub/token", "partition": "P_A", "root": "Work", "path": ["(empty segment: U+2300)", "GitHub", "token"], "node": "item", "notes": "empty segment preserved with the U+2300 display marker" },
+    { "id": "P08", "name_hex": "2f6c6561642f78", "name": "/lead/x", "partition": "P_A", "root": "(empty segment: U+2300) (named)", "path": ["lead", "x"], "node": "item", "notes": "leading slash: the empty first segment is the vault, rendered with the U+2300 marker" },
+    { "id": "P09", "name_hex": "747261696c2f", "name": "trail/", "partition": "P_A", "root": "Default (ungrouped)", "path": ["trail", "(empty segment: U+2300)"], "node": "item", "notes": "trailing slash: empty leaf segment preserved" },
+    { "id": "P10", "name_hex": "612f2e2f62", "name": "a/./b", "partition": "P_A", "root": "Default (ungrouped)", "path": ["a", ".", "b"], "node": "item", "notes": "dot segment is data; no normalization" },
+    { "id": "P11", "name_hex": "615c62", "name": "a\\b", "partition": "P_A", "root": "Default (ungrouped)", "path": ["a\\b"], "node": "item", "notes": "backslash is data inside a single segment; displays escaped as a\\b" },
+    { "id": "P12", "name_hex": "576f726b2fff2f78", "name": "Work/<0xFF>/x", "partition": "P_A", "root": "Work", "path": ["\\xff", "x"], "node": "item", "notes": "non-UTF-8 byte 0xFF inside a segment renders as \\xff" },
+    { "id": "P13", "name_repeat": { "byte": 97, "count": 255 }, "name": "(255 x 'a')", "partition": "P_A", "root": "Default (ungrouped)", "path": ["(255 x 'a')"], "node": "item", "notes": "maximum-length name (255 bytes); value bound 473 - 255 = 218 bytes; a 256-byte name must be rejected with InvalidName" },
+    { "id": "P14", "name_hex": "44454c455445443a6f6c64", "name": "DELETED:old", "partition": "P_A", "root": null, "path": null, "node": "tombstone", "notes": "hidden from normal results; the slot stays eligible for tombstone reuse" },
+    { "id": "P15", "name_hex": "6231", "name": "b1", "partition": "P_B", "root": "Default (ungrouped)", "path": ["b1"], "node": "item", "notes": "invisible in P_A sessions at any generation" }
+  ],
+  "codes_cases": [
+    { "id": "C01", "name_hex": "746f747033322f476974487562", "name": "totp32/GitHub", "partition": "P_A", "codes_auto_index": true, "code_kind": "base32", "notes": "exact component 'totp32' anywhere in the path selects base32-first decoding (upstream s_totp32 quirks: stops at NUL/=/LF, rejects lowercase and digits 0/1/8/9)" },
+    { "id": "C02", "name_hex": "4769744875622f746f74703332", "name": "GitHub/totp32", "partition": "P_A", "codes_auto_index": true, "code_kind": "base32" },
+    { "id": "C03", "name_hex": "576f726b2f746f747033322f4769744875622f616c6578", "name": "Work/totp32/GitHub/alex", "partition": "P_A", "codes_auto_index": true, "code_kind": "base32" },
+    { "id": "C04", "name_hex": "576f726b2f746f70742f4769744875622f616c6578", "name": "Work/topt/GitHub/alex", "partition": "P_A", "codes_auto_index": true, "code_kind": "alias-raw", "notes": "'topt' display alias (raw TOTP by default, consistent with 'totp'); never passed blindly to the core totp_for matcher; explicit supported import metadata may select base32" },
+    { "id": "C05", "name_hex": "6578616d706c652f746f7470", "name": "example/totp", "partition": "P_A", "codes_auto_index": true, "code_kind": "raw" },
+    { "id": "C06", "name_hex": "6578616d706c652f746f74703332", "name": "example/totp32", "partition": "P_A", "codes_auto_index": true, "code_kind": "base32" },
+    { "id": "C07", "name_hex": "746f74702d6e6f746573", "name": "totp-notes", "partition": "P_A", "codes_auto_index": false, "code_kind": "raw-on-explicit-request", "notes": "a label containing 'totp' does not by itself enter the Codes list; an explicit per-item code request still follows the CLI's historical substring conventions (core totp_for)" },
+    { "id": "C08", "name_hex": "6d79746f74706b6579", "name": "mytotpkey", "partition": "P_A", "codes_auto_index": false, "code_kind": "raw-on-explicit-request", "notes": "documented divergence: CLI `show` renders a code (substring match); the Codes auto-index requires an exact component" },
+    { "id": "C09", "name_hex": "74657374", "name": "test", "partition": "P_A", "codes_auto_index": false, "code_kind": "none", "notes": "plain password record; the Ctrl+Enter code action is disabled" }
+  ],
+  "code_expectations": {
+    "period_seconds": 30,
+    "digits": 6,
+    "leading_zeros": "preserved",
+    "counter": "unix_now / 30",
+    "invalid_seed": "display 'Code unavailable'; the seed is never the fallback copy result",
+    "expiry_display": "30 at rollover, 1 in the final second; the countdown runs only while the Codes view is visible and unlocked",
+    "seed_handling": "seed bytes never leave the broker; only the derived six digits reach the clipboard"
+  },
+  "clipboard_cases": [
+    { "id": "K01", "kind": "text", "value_utf8": "hunter2", "expect": "copy-ok", "notes": "exact content preserved" },
+    { "id": "K02", "kind": "text-with-trailing-LF", "value_hex": "68656c6c6f0a", "expect": "copy-ok", "notes": "no newline normalization" },
+    { "id": "K03", "kind": "binary", "value_hex": "00010203", "expect": "refuse-text-copy", "notes": "interior NUL: not text; typed error 0x109 ValueNotText; nothing published" },
+    { "id": "K04", "kind": "invalid-utf8", "value_hex": "fffe", "expect": "refuse-text-copy", "notes": "invalid UTF-8: not text; typed error 0x109 ValueNotText; nothing published" },
+    { "id": "K05", "kind": "code", "value": "derived six digits", "expect": "copy-ok-with-earlier-timeout", "notes": "TTL = min(30 s, remaining code window)" }
+  ],
+  "identity_cases": [
+    { "id": "I01", "notes": "exact duplicate raw names created by rename without a uniqueness check: both slots stay individually discoverable by slot ID; core first-match lookup returns the lower slot; copy/mutation by name alone is disabled when ambiguous" },
+    { "id": "I02", "notes": "open/list/search/copy leave the store byte-identical (sha256 before == after)" },
+    { "id": "I03", "notes": "a mutation under P_A preserves every P_B record byte-for-byte at its slot; verified by hash of the decrypted entries" },
+    { "id": "I04", "notes": "maximum name length 255 bytes and value bound 473 - name_len are accepted at the boundary and rejected one byte over" },
+    { "id": "I05", "notes": "stale item IDs (previous session generation) are rejected with 0x102/15 before any sensitive operation" }
+  ],
+  "perf_corpus": {
+    "recipe": {
+      "count": 10000,
+      "names": "9500 x 'perf/group-<g:02d>/item-<i:05d>' (250 groups), 250 x duplicate leaf names 'perf/dup/<a..>/token', 250 x deep paths 'perf/deep/<d>/<d>/.../token' (12 segments)",
+      "value": "short synthetic text; stores contain synthetic data only",
+      "generation": "scripts/bench.ps1 materializes this corpus into a gitignored store before measurement"
+    },
+    "requirements": "include identical leaf names and deeply nested paths; measure after indexing is complete; keep cold launch, unlock/KDF, and warm summon as separate measurements"
+  },
+  "compatibility": {
+    "cross_checks": "round-trip this manifest's stores through the existing CLI (wsecret list/show/dump) and the core library; byte-exact dump equality is the oracle; opening/listing/searching/copying must leave the file unchanged",
+    "partition_isolation": "records of the other passphrase remain byte-preserved and readable after any mutation",
+    "unexecuted_note": "all rows here are planned expectations; results only count when recorded in a filled evidence file"
+  }
+}

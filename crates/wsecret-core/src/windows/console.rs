@@ -15,13 +15,16 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, ReadConsoleW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleW,
+    ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_QUICK_EDIT_MODE, GetConsoleMode, GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW,
+    ReadConsoleW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
+    WriteConsoleW,
 };
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 /// `CreateFileW` disposition `OPEN_EXISTING` (winbase.h constant; same
 /// local definition as `file.rs`).
@@ -149,6 +152,145 @@ impl ConsoleInput {
         }
         Ok(read as usize)
     }
+
+    /// Reads one MASKED line as UTF-16 code units without any echo and with
+    /// bounded waiting — the broker-owned native input primitive (Quick
+    /// Access: "broker-owned native input"). Unlike [`Self::read_utf16`]
+    /// (line-input `ReadConsoleW`), this reads raw input RECORDS so the read
+    /// can be cancelled and time-bounded:
+    ///
+    /// - echo is suppressed and line editing/quick-edit are disabled for the
+    ///   duration (the saved mode is restored on EVERY exit path, including
+    ///   errors, via an RAII guard);
+    /// - `WaitForSingleObject` slices of 100 ms poll `cancel` and `deadline`
+    ///   between reads;
+    /// - `'\r'`/`'\n'` submits, backspace edits, Ctrl+Z on an empty line is
+    ///   upstream EOF (`s_exit(0)`), Ctrl+C/Ctrl+Break arrives as key `\x03`
+    ///   and reports [`MaskedLine::Cancelled`] (the console-control handler
+    ///   never sees it because `ENABLE_PROCESSED_INPUT` is cleared);
+    /// - every other character accumulates verbatim (control characters
+    ///   included) and the PROMPT layer applies upstream's validation
+    ///   (`Invalid input!` for bytes `< 0x20`).
+    ///
+    /// `max_units` is the upstream buffer rule: the `max_units + 1`-st unit
+    /// before the terminator is [`MaskedLine::Overflow`] (`Input too long!`).
+    /// The returned `Line` buffer is the caller's to zeroize
+    /// ([`wipe_units`]); every other outcome wipes the scratch buffer here.
+    pub fn read_masked_line(
+        &self,
+        max_units: usize,
+        deadline: std::time::Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> io::Result<MaskedLine> {
+        let saved = self.mode()?;
+        // Suppress echo and line editing; disable quick-edit so a mouse
+        // selection cannot block the read; clear processed input so Ctrl+C
+        // arrives as a key record we map to cancellation.
+        let masked = (saved | ENABLE_EXTENDED_FLAGS)
+            & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE);
+        struct ModeGuard<'a> {
+            input: &'a ConsoleInput,
+            saved: u32,
+        }
+        impl Drop for ModeGuard<'_> {
+            fn drop(&mut self) {
+                let _ = self.input.set_mode(self.saved);
+            }
+        }
+        let _guard = ModeGuard { input: self, saved };
+        self.set_mode(masked)?;
+
+        let mut line: Vec<u16> = Vec::new();
+        let mut overflow = false;
+        let mut records = [INPUT_RECORD::default(); 16];
+        loop {
+            if cancel() {
+                wipe_units(&mut line);
+                return Ok(MaskedLine::Cancelled);
+            }
+            if std::time::Instant::now() >= deadline {
+                wipe_units(&mut line);
+                return Ok(MaskedLine::TimedOut);
+            }
+            // SAFETY: `self.handle` is a live console input handle; the
+            // record array is valid for 16 exclusive INPUT_RECORD slots.
+            let wait = unsafe { WaitForSingleObject(self.handle, 100) };
+            if wait != WAIT_OBJECT_0 {
+                continue;
+            }
+            let mut read: u32 = 0;
+            // SAFETY: as above; `read` receives the number of records filled.
+            let ok = unsafe {
+                ReadConsoleInputW(self.handle, records.as_mut_ptr(), records.len() as u32, &mut read)
+            };
+            if ok == 0 {
+                wipe_units(&mut line);
+                return Err(io::Error::last_os_error());
+            }
+            for record in records.iter().take(read as usize) {
+                // SAFETY: `EventType` is read before the union arm; the
+                // active arm is `KeyEvent` exactly when EventType says so.
+                if record.EventType as u32 != KEY_EVENT {
+                    continue;
+                }
+                let key = unsafe { record.Event.KeyEvent };
+                if key.bKeyDown == 0 {
+                    continue;
+                }
+                // SAFETY: `uChar`'s active member for key events is
+                // `UnicodeChar` (the ASCII member is the same 2 bytes).
+                let ch = unsafe { key.uChar.UnicodeChar };
+                if ch == 0 {
+                    continue; // extended key (arrows, function keys)
+                }
+                for _ in 0..key.wRepeatCount.max(1) {
+                    match ch {
+                        // '\r' / '\n' submit the line.
+                        0x0D | 0x0A => {
+                            if overflow {
+                                wipe_units(&mut line);
+                                return Ok(MaskedLine::Overflow);
+                            }
+                            return Ok(MaskedLine::Line(line));
+                        }
+                        0x08 => {
+                            line.pop();
+                        }
+                        0x1a if line.is_empty() => {
+                            wipe_units(&mut line);
+                            return Ok(MaskedLine::Eof);
+                        }
+                        0x03 => {
+                            wipe_units(&mut line);
+                            return Ok(MaskedLine::Cancelled);
+                        }
+                        _ => {
+                            if line.len() >= max_units {
+                                overflow = true;
+                            } else {
+                                line.push(ch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of [`ConsoleInput::read_masked_line`].
+pub enum MaskedLine {
+    /// A terminated line (content without the terminator; the caller wipes).
+    Line(Vec<u16>),
+    /// Ctrl+Z on an empty line / end of input (upstream `s_exit(0)`).
+    Eof,
+    /// Cancellation: the cancel flag or Ctrl+C/Ctrl+Break.
+    Cancelled,
+    /// The deadline expired before a terminator.
+    TimedOut,
+    /// More than `max_units` units before the terminator (upstream
+    /// `Input too long!`).
+    Overflow,
 }
 
 impl ConsoleOutput {

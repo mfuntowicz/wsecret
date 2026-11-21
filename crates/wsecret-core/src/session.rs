@@ -237,6 +237,18 @@ fn protect_in_place(buf: &mut [u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Initializes locked-memory, WER-exclusion and DPAPI native state with a
+/// zeroed, nonsecret buffer. Hosts call this after process hardening and
+/// before native-thread registration so first use cannot introduce an
+/// unregistered thread during a live key operation.
+pub fn initialize_native_memory() -> Result<(), Error> {
+    let mut buf = SecretBytes::new(CRYPTPROTECTMEMORY_BLOCK_SIZE as usize)?;
+    protect_in_place(buf.as_mut_slice())?;
+    unprotect_in_place(buf.as_mut_slice())?;
+    buf.clear();
+    Ok(())
+}
+
 /// Decrypts `buf` in place (the inverse of [`protect_in_place`]).
 /// Failure → [`Error::MemoryProtection`].
 fn unprotect_in_place(buf: &mut [u8]) -> Result<(), Error> {
@@ -360,8 +372,9 @@ impl Session {
     /// error no session is created and every buffer is already erased.
     pub fn unlock(header: &Header, pass: &mut [u8]) -> Result<Session, Error> {
         // Monitoring/admission starts BEFORE the KDF. The guard also covers
-        // publication, so a poisoned in-flight unlock never creates a session.
-        let _acquisition = security::begin_secret_acquisition()?;
+        // publication and the closing drain, so a poisoned in-flight unlock
+        // never creates a session.
+        let acquisition = security::begin_secret_acquisition()?;
         // The guard owns `pass` for the whole function: zeroized on every
         // return path, including errors and unwinds.
         let mut pass = EraseOnDrop::new(pass);
@@ -388,13 +401,22 @@ impl Session {
 
         let key = SessionKey::new(key);
         let residency = security::publish_session(&key)?;
-        Ok(Session {
+        let session = Session {
             header: header.clone(),
             key,
             residency: Some(residency),
             evidence: UnlockEvidence::NoMatchingRecords,
             _not_sync: PhantomData,
-        })
+        };
+        // The acquisition's closing drain runs at this drop. If that drain (or
+        // publication) poisoned the process, the unlock must not report
+        // success: the error return drops and wipes the constructed session
+        // and the watchdog drain clears every resident key.
+        drop(acquisition);
+        if security::process_is_poisoned() {
+            return Err(Error::MemoryProtection);
+        }
+        Ok(session)
     }
 
     /// Builds a session from an already-derived key (unit tests only: no
@@ -403,18 +425,26 @@ impl Session {
     /// material behind.
     #[cfg(test)]
     pub(crate) fn from_parts(header: Header, key: [u8; 32]) -> Result<Session, Error> {
-        let _acquisition = security::begin_secret_acquisition()?;
+        let acquisition = security::begin_secret_acquisition()?;
         let mut rest = SecretBytes::from_slice(&key)?;
         protect_in_place(rest.as_mut_slice())?;
         let key = SessionKey::new(rest);
         let residency = security::publish_session(&key)?;
-        Ok(Session {
+        let session = Session {
             header,
             key,
             residency: Some(residency),
             evidence: UnlockEvidence::NoMatchingRecords,
             _not_sync: PhantomData,
-        })
+        };
+        // Same poisoned-acquisition rule as `unlock` (identical ordering; the
+        // issue is structural here too). Behavior-neutral for the fixture
+        // tests: `process_is_poisoned` is false without the §5.8 boundary.
+        drop(acquisition);
+        if security::process_is_poisoned() {
+            return Err(Error::MemoryProtection);
+        }
+        Ok(session)
     }
 
     /// The store header this session was unlocked against.

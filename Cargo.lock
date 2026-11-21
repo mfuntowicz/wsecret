@@ -361,6 +361,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsecret-broker"
+version = "0.1.0"
+dependencies = [
+ "libhydrogen-sys",
+ "windows-sys",
+ "wsecret-core",
+]
+
+[[package]]
 name = "wsecret-cli"
 version = "0.1.0"
 dependencies = [

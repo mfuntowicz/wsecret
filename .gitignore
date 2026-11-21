@@ -1,1 +1,21 @@
 /target/
+
+# .NET / WinUI build output
+/src/**/bin/
+/src/**/obj/
+/src/**/AppPackages/
+/src/**/BundleArtifacts/
+.vs/
+*.user
+
+# MSIX packaging output and signing material (keys never in source control)
+/dist/
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.pfx
+*.p12
+
+# Generated evidence (templates live in fixtures/quick-access/)
+/evidence/

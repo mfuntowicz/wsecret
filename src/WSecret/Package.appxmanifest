@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX package identity (contract with docs/build.md and scripts/build.ps1):
+  Identity Name=com.wsecret.QuickAccess, Publisher=CN=WSecret, Version=0.2.1.1,
+  Application Id=WSecret, AUMID = <PackageFamilyName>!WSecret.
+  Any signing certificate must use the exact subject CN=WSecret.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop rescap">
+
+  <Identity Name="com.wsecret.QuickAccess" Publisher="CN=WSecret" Version="0.2.1.1" />
+
+  <Properties>
+    <DisplayName>WSecret</DisplayName>
+    <PublisherDisplayName>Morgan Funtowicz</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="WSecret" Executable="$targetnametoken$.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="WSecret"
+        Description="WSecret Quick Access"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square71x71Logo="Assets\SmallTile.png" Square310x310Logo="Assets\Square310x310Logo.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Launch at sign-in (toggled from the tray menu / settings flyout via
+             Windows.ApplicationModel.StartupTask "WSecretStartup"). -->
+        <desktop:Extension Category="windows.startupTask" Executable="WSecret.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="WSecretStartup" Enabled="true" DisplayName="WSecret Quick Access" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+</Package>

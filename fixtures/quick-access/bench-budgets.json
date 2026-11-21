@@ -1,0 +1,78 @@
+{
+  "schema": "wsecret.fixtures.quick-access.bench/1",
+  "status": "PREREGISTERED BUDGETS — no Quick Access measurement has been executed as of 2026-11-19. Filled results belong in evidence/ (git-ignored), copied from fixtures/quick-access/bench-evidence.template.md.",
+  "method": {
+    "build": "packaged Release build, no debugger",
+    "machine": "named Windows 11 reference machine, AC power",
+    "reporting": "percentiles (p50/p95/p99), min/max, sample count, hardware, build, and baseline for every row",
+    "separation": "keep cold launch, unlock/KDF, and warm summon as separate measurements; protective settings (key zeroization, VirtualLock, watchdog, KDF cost) stay enabled during all measurements",
+    "samples_default": 100
+  },
+  "corpus": {
+    "source": "fixtures/quick-access/manifest.json perf_corpus recipe (10,000 synthetic names incl. identical leaf names and 12-segment deep paths)",
+    "generation": "materialized into a git-ignored synthetic store before measurement",
+    "harness": null
+  },
+  "measurements": [
+    {
+      "id": "warm-summon",
+      "name": "Warm hotkey to search field accepting the first keystroke",
+      "budget": { "p95_ms_max": 100 },
+      "samples_min": 100,
+      "harness": null,
+      "notes": "Verify a typed first character is present in the field, not merely that the window painted. Warm = app resident and previously summoned."
+    },
+    {
+      "id": "keystroke-results",
+      "name": "Keystroke to correct results painted (10,000 synthetic names after indexing)",
+      "budget": { "p95_ms_max": 50 },
+      "samples_min": 100,
+      "harness": null,
+      "notes": "Corpus includes identical leaf names and deeply nested paths; measure after indexing completes; ranking must be stable across samples."
+    },
+    {
+      "id": "idle-steady",
+      "name": "Hidden/locked steady state",
+      "budget": { "periodic_ui_search_otp_polling": "none" },
+      "window_s": 60,
+      "type": "evidence",
+      "harness": null,
+      "notes": "Record idle CPU, UI private bytes, broker private bytes, and wakeups SEPARATELY. Explicitly account for the core residency watchdog while an unlocked session exists. A watchdog that only runs while unlocked is not a steady-state polling violation."
+    },
+    {
+      "id": "cold-launch",
+      "name": "Cold launch to first paint (locked state)",
+      "budget": "record (no fixed target)",
+      "type": "record",
+      "harness": null
+    },
+    {
+      "id": "unlock-index",
+      "name": "Passphrase unlock + names-only index build",
+      "budget": "record (no fixed target)",
+      "type": "record",
+      "kdf_ops_limit": 100000,
+      "harness": null,
+      "notes": "KDF cost must remain at the store's encoded ops_limit; never reduce cost for the benchmark."
+    },
+    {
+      "id": "secure-copy",
+      "name": "Copy gesture to clipboard publication (broker round-trip incl. exclusions)",
+      "budget": "record (no fixed target)",
+      "type": "record",
+      "harness": null
+    },
+    {
+      "id": "lock-invalidate",
+      "name": "Lock request to complete session invalidation (IDs dead, index cleared, clipboard owned content cleared)",
+      "budget": "record (no fixed target)",
+      "type": "record",
+      "harness": null
+    }
+  ],
+  "harness_contract": {
+    "command": "string with {STORE}, {SAMPLES}, {OUT} placeholders; run by scripts/bench.ps1",
+    "output": "one latency sample in milliseconds per stdout line (invariant-culture decimal); evidence notes go to {OUT}",
+    "missing": "harness null or command failing = the row is recorded UNEXECUTED; never estimated"
+  }
+}

@@ -265,8 +265,12 @@ pub enum LimitKind {
     /// caller's ceiling ([`crate::store::Limits::max_opslimit`]).
     OpsLimit,
     /// The store file size is above the caller's ceiling
-    /// ([`crate::store::Limits::max_store_bytes`]).
+    /// ([`crate::store::Limits::max_store_bytes`]; the ordinary-open default
+    /// is [`crate::store::STORE_BYTES_MAX`]).
     StoreBytes,
+    /// A search query is longer than the bound the index/search layer
+    /// accepts ([`crate::quick::SEARCH_NEEDLE_MAX`]).
+    SearchNeedle,
 }
 
 /// The explicit remedy for an exceeded limit (WS-06: a cap rejection must
@@ -278,8 +282,12 @@ pub enum LimitRemedy {
     /// position before the command word. It lifts only the `ops_limit`
     /// ceiling: the [`crate::format::OPS_LIMIT_MIN`] floor still applies.
     AllowExpensiveKdf,
-    /// No user override exists: the calling application configured the bound.
-    CallerConfigured,
+    /// Reopen this specific file with the explicit per-open trusted-file
+    /// override ([`crate::store::Limits::trusted_file`]), which raises or
+    /// lifts the store-size ceiling. Never implicit.
+    TrustedFileOverride,
+    /// Shorten the search query below the bound.
+    ShortenQuery,
 }
 
 /// Diagnosis carried by [`Error::ResourceLimit`]: which limit was exceeded,
@@ -290,7 +298,8 @@ pub enum LimitRemedy {
 pub struct LimitExceeded {
     /// Which bound was exceeded.
     pub kind: LimitKind,
-    /// The offending value found (header `ops_limit`, store size in bytes).
+    /// The offending value found (header `ops_limit`, store size in bytes,
+    /// search query length in bytes).
     pub actual: u64,
     /// The configured numerical bound.
     pub limit: u64,
@@ -311,14 +320,20 @@ impl fmt::Display for LimitExceeded {
                 "Store size {} exceeds the limit of {} bytes",
                 self.actual, self.limit
             )?,
+            LimitKind::SearchNeedle => write!(
+                f,
+                "Search query of {} bytes exceeds the limit of {} bytes",
+                self.actual, self.limit
+            )?,
         }
         match self.remedy {
             LimitRemedy::AllowExpensiveKdf => f.write_str(
                 "; re-run with --allow-expensive-kdf before the command to allow expensive key derivation",
             ),
-            LimitRemedy::CallerConfigured => {
-                f.write_str("; the limit is configured by the calling application")
-            }
+            LimitRemedy::TrustedFileOverride => f.write_str(
+                "; reopen this file with the explicit trusted-file override to raise the store-size limit",
+            ),
+            LimitRemedy::ShortenQuery => f.write_str("; shorten the search query"),
         }
     }
 }
@@ -343,7 +358,9 @@ pub enum Error {
     /// the diagnosis: which limit, the offending value, the numerical bound
     /// and the explicit remedy).
     ResourceLimit(LimitExceeded),
-    /// Secret-memory protection (locking/zeroization) failed.
+    /// Secret-memory or kernel security-descriptor protection failed
+    /// (locking/zeroization, or a security object — e.g. the writer mutex —
+    /// failed its exact-DACL contract and writes are refused).
     MemoryProtection,
     /// The operation requires user confirmation before proceeding.
     ConfirmationRequired,
@@ -727,13 +744,27 @@ mod tests {
             kind: LimitKind::StoreBytes,
             actual: 4096,
             limit: 512,
-            remedy: LimitRemedy::CallerConfigured,
+            remedy: LimitRemedy::TrustedFileOverride,
         });
         assert_eq!(bytes.status(), Status::ResourceLimit);
         assert_eq!(
             bytes.to_string(),
-            "Store size 4096 exceeds the limit of 512 bytes; the limit is \
-             configured by the calling application"
+            "Store size 4096 exceeds the limit of 512 bytes; reopen this \
+             file with the explicit trusted-file override to raise the \
+             store-size limit"
+        );
+
+        let query = Error::ResourceLimit(LimitExceeded {
+            kind: LimitKind::SearchNeedle,
+            actual: 300,
+            limit: 255,
+            remedy: LimitRemedy::ShortenQuery,
+        });
+        assert_eq!(query.status(), Status::ResourceLimit);
+        assert_eq!(
+            query.to_string(),
+            "Search query of 300 bytes exceeds the limit of 255 bytes; \
+             shorten the search query"
         );
     }
 

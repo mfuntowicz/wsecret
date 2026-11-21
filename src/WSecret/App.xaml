@@ -1,0 +1,130 @@
+<Application
+    x:Class="WSecret.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Application.Resources>
+        <ResourceDictionary>
+
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!--
+              Palette contract:
+              - Light/Dark: Mica-friendly translucent cards, a neutral/amber
+                state palette kept for status chrome (e.g. hotkey errors), and a
+                subtle accent line; interactive text and icons always fall back to
+                the native theme foreground.
+              - HighContrast: every custom brush maps to a system color so the
+                shell is fully usable with contrast themes; the Mica backdrop
+                automatically falls back to the solid theme background.
+            -->
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Default">
+                    <SolidColorBrush x:Key="PaletteSurfaceBrush" Color="#CA152036" />
+                    <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#D526334B" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#CE30405C" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="#B31F1F1F" />
+                    <SolidColorBrush x:Key="CardBorderBrush" Color="#24FFFFFF" />
+                    <SolidColorBrush x:Key="SubtleTextBrush" Color="#B3FFFFFF" />
+                    <SolidColorBrush x:Key="AccentLineBrush" Color="#FF4CC2FF" />
+                    <SolidColorBrush x:Key="StateLockedBrush" Color="#FF767676" />
+                    <SolidColorBrush x:Key="StateLockedTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="StateUnlockedBrush" Color="#FF10893E" />
+                    <SolidColorBrush x:Key="StateUnlockedTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="StateBusyBrush" Color="#FFB8860B" />
+                    <SolidColorBrush x:Key="StateBusyTextBrush" Color="#FF1B1B1B" />
+                    <SolidColorBrush x:Key="SubduedButtonBackground" Color="#00000000" />
+                    <!-- Brand mark for result icons (e.g. GitLab's warm orange). In high
+                         contrast this intentionally equals the native foreground. -->
+                    <SolidColorBrush x:Key="BrandMarkBrush" Color="#FFFC6D26" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="PaletteSurfaceBrush" Color="#C8F2F6FC" />
+                    <StaticResource x:Key="TextControlBackgroundFocused" ResourceKey="ControlFillColorInputActiveBrush" />
+                    <StaticResource x:Key="ListViewItemBackgroundSelected" ResourceKey="SubtleFillColorSecondaryBrush" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="#CCFFFFFF" />
+                    <SolidColorBrush x:Key="CardBorderBrush" Color="#14000000" />
+                    <SolidColorBrush x:Key="SubtleTextBrush" Color="#99000000" />
+                    <SolidColorBrush x:Key="AccentLineBrush" Color="#FF0067C0" />
+                    <SolidColorBrush x:Key="StateLockedBrush" Color="#FF6B6B6B" />
+                    <SolidColorBrush x:Key="StateLockedTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="StateUnlockedBrush" Color="#FF0F7B0F" />
+                    <SolidColorBrush x:Key="StateUnlockedTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="StateBusyBrush" Color="#FF9D5D00" />
+                    <SolidColorBrush x:Key="StateBusyTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="SubduedButtonBackground" Color="#00000000" />
+                    <SolidColorBrush x:Key="BrandMarkBrush" Color="#FFE24329" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Dark">
+                    <SolidColorBrush x:Key="PaletteSurfaceBrush" Color="#CA152036" />
+                    <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#D526334B" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="#CE30405C" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="#B31F1F1F" />
+                    <SolidColorBrush x:Key="CardBorderBrush" Color="#24FFFFFF" />
+                    <SolidColorBrush x:Key="SubtleTextBrush" Color="#B3FFFFFF" />
+                    <SolidColorBrush x:Key="AccentLineBrush" Color="#FF4CC2FF" />
+                    <SolidColorBrush x:Key="StateLockedBrush" Color="#FF767676" />
+                    <SolidColorBrush x:Key="StateLockedTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="StateUnlockedBrush" Color="#FF10893E" />
+                    <SolidColorBrush x:Key="StateUnlockedTextBrush" Color="#FFFFFFFF" />
+                    <SolidColorBrush x:Key="StateBusyBrush" Color="#FFB8860B" />
+                    <SolidColorBrush x:Key="StateBusyTextBrush" Color="#FF1B1B1B" />
+                    <SolidColorBrush x:Key="SubduedButtonBackground" Color="#00000000" />
+                    <SolidColorBrush x:Key="BrandMarkBrush" Color="#FFFC6D26" />
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="HighContrast">
+                    <SolidColorBrush x:Key="PaletteSurfaceBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="ListViewItemBackgroundSelected" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="CardBackgroundBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                    <SolidColorBrush x:Key="CardBorderBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="SubtleTextBrush" Color="{ThemeResource SystemColorGrayTextColor}" />
+                    <SolidColorBrush x:Key="AccentLineBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="StateLockedBrush" Color="{ThemeResource SystemColorButtonFaceColor}" />
+                    <SolidColorBrush x:Key="StateLockedTextBrush" Color="{ThemeResource SystemColorButtonTextColor}" />
+                    <SolidColorBrush x:Key="StateUnlockedBrush" Color="{ThemeResource SystemColorHighlightColor}" />
+                    <SolidColorBrush x:Key="StateUnlockedTextBrush" Color="{ThemeResource SystemColorHighlightTextColor}" />
+                    <SolidColorBrush x:Key="StateBusyBrush" Color="{ThemeResource SystemColorHotlightColor}" />
+                    <SolidColorBrush x:Key="StateBusyTextBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="SubduedButtonBackground" Color="{ThemeResource SystemColorButtonFaceColor}" />
+                    <SolidColorBrush x:Key="BrandMarkBrush" Color="{ThemeResource SystemColorWindowTextColor}" />
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+
+            <!-- Shared card chrome used by every workspace panel. -->
+            <Style x:Key="CardBorderStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardBorderBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="16" />
+            </Style>
+
+            <!-- Subdued toolbar/footnote buttons: no resting chrome in light/dark,
+                 a real button face in high contrast so the control stays perceivable. -->
+            <Style x:Key="SubduedButtonStyle" TargetType="Button" BasedOn="{StaticResource DefaultButtonStyle}">
+                <Setter Property="Background" Value="{ThemeResource SubduedButtonBackground}" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="Padding" Value="8,4" />
+                <Setter Property="MinWidth" Value="0" />
+                <Setter Property="MinHeight" Value="0" />
+            </Style>
+
+            <Style x:Key="BrandResultIcon" TargetType="PathIcon">
+                <Setter Property="Foreground" Value="{ThemeResource BrandMarkBrush}" />
+            </Style>
+
+            <!-- Shortcut-hint keycap in the footer. -->
+            <Style x:Key="ShortcutKeyStyle" TargetType="Border">
+                <Setter Property="BorderBrush" Value="{ThemeResource CardBorderBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="4" />
+                <Setter Property="Padding" Value="8,2" />
+                <Setter Property="Background" Value="{ThemeResource ControlFillColorSecondaryBrush}" />
+            </Style>
+
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

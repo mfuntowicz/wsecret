@@ -7,10 +7,10 @@
 //! everything through the safe facades below.
 //!
 //! The former vault-agent capability transport is gone: no capability
-//! message is ever built, no handle value is ever adopted, and no session key
-//! crosses this module. [`spawn_ssh_child`] inherits only the deliberately
-//! duplicated standard handles, advertises `SSH_AUTH_SOCK` naming the
-//! VERIFIED Windows OpenSSH agent endpoint, and strips the legacy
+//! message is ever built, no untrusted handle value is ever adopted, and no
+//! session key crosses this module. [`spawn_ssh_child`] inherits only the
+//! deliberately duplicated standard handles, advertises `SSH_AUTH_SOCK`
+//! naming the VERIFIED Windows OpenSSH agent endpoint, and strips the legacy
 //! `SECRET_AGENT` entry from the child environment.
 //!
 //! Surface:
@@ -22,6 +22,10 @@
 //!   limits inheritance to the duplicated std handles, the birth descriptors
 //!   are verified before the child may run, and the launcher keeps only a
 //!   `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` handle.
+//! - [`create_anonymous_channel`] + [`spawn_broker_child`]: the
+//!   `wsecret-broker` private channel — two anonymous pipes, the child
+//!   inheriting EXACTLY the two broker-side handles (no std handles, no
+//!   named endpoint), same birth hardening and reduced handle hygiene.
 //! - [`AgentChild`]: wait for the child and read its exit status through the
 //!   reduced handle.
 
@@ -30,9 +34,10 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetHandleInformation, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
 };
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SYNCHRONIZE,
 };
@@ -40,6 +45,7 @@ use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -529,6 +535,25 @@ fn fold_case(w: &[u16]) -> Vec<u16> {
         .collect()
 }
 
+/// What one trusted spawn may hand the child (plan §5.8 point 4 hardening
+/// applies to BOTH variants: the birth descriptors are verified and the
+/// launcher keeps only the reduced child handle).
+pub enum InheritSpec {
+    /// `wsecret ssh agent`: ONLY the deliberately duplicated standard
+    /// handles (unchanged behavior).
+    StdHandles,
+    /// `wsecret-broker`: EXACTLY the two private anonymous-pipe handles of
+    /// the inherited channel (command read end + response write end). NO
+    /// standard handle is inherited (`STARTF_USESTDHANDLES` with NULLs);
+    /// there is no named endpoint anywhere.
+    BrokerChannel {
+        /// Broker end of the command channel (reads requests).
+        cmd_rd: HANDLE,
+        /// Broker end of the response channel (writes responses).
+        resp_wr: HANDLE,
+    },
+}
+
 /// Spawns the `wsecret ssh agent` child (WS-04): the child receives ONLY the
 /// deliberately duplicated ordinary standard handles plus `SSH_AUTH_SOCK`
 /// naming the VERIFIED Windows OpenSSH agent endpoint, passed verbatim as the
@@ -549,16 +574,180 @@ pub fn spawn_ssh_child(
         EnvChange::Remove(std::ffi::OsStr::new(ENV_AGENT)),
         EnvChange::Set(std::ffi::OsStr::new(ENV_SSH_AUTH_SOCK), ssh_auth_sock),
     ])?;
-    spawn_child_core(application, argv, env_block)
+    spawn_child_core(application, argv, env_block, InheritSpec::StdHandles)
+}
+
+/// The parent end of a private broker channel: write commands
+/// ([`BrokerChannelParent::cmd_wr`]) and read responses
+/// ([`BrokerChannelParent::resp_rd`]). The ends are NON-inheritable — only
+/// the broker-side pair ever crosses a process boundary.
+pub struct BrokerChannelParent {
+    cmd_wr: HANDLE,
+    resp_rd: HANDLE,
+}
+
+impl BrokerChannelParent {
+    /// Command-channel write end (parent writes requests).
+    pub fn cmd_wr(&self) -> HANDLE {
+        self.cmd_wr
+    }
+
+    /// Response-channel read end (parent reads responses).
+    pub fn resp_rd(&self) -> HANDLE {
+        self.resp_rd
+    }
+}
+
+impl Drop for BrokerChannelParent {
+    fn drop(&mut self) {
+        // SAFETY: live handles owned by this value, closed once.
+        unsafe {
+            if !self.cmd_wr.is_null() {
+                CloseHandle(self.cmd_wr);
+            }
+            if !self.resp_rd.is_null() {
+                CloseHandle(self.resp_rd);
+            }
+        }
+        self.cmd_wr = std::ptr::null_mut();
+        self.resp_rd = std::ptr::null_mut();
+    }
+}
+
+/// The broker end of a private broker channel (exactly two INHERITABLE
+/// handles). Hand both values to the child via argv, then pass the whole
+/// pair to [`spawn_broker_child`], which consumes and closes them.
+pub struct BrokerChannelChild {
+    cmd_rd: HANDLE,
+    resp_wr: HANDLE,
+}
+
+impl BrokerChannelChild {
+    /// Command-channel read handle VALUE for the child's `--rd-handle`.
+    pub fn rd_value(&self) -> usize {
+        self.cmd_rd as usize
+    }
+
+    /// Response-channel write handle VALUE for the child's `--wr-handle`.
+    pub fn wr_value(&self) -> usize {
+        self.resp_wr as usize
+    }
+}
+
+impl Drop for BrokerChannelChild {
+    fn drop(&mut self) {
+        // SAFETY: live handles owned by this value, closed once.
+        unsafe {
+            if !self.cmd_rd.is_null() {
+                CloseHandle(self.cmd_rd);
+            }
+            if !self.resp_wr.is_null() {
+                CloseHandle(self.resp_wr);
+            }
+        }
+        self.cmd_rd = std::ptr::null_mut();
+        self.resp_wr = std::ptr::null_mut();
+    }
+}
+
+/// Creates one private anonymous-pipe channel pair (plan: "private inherited
+/// anonymous-pipe channel; no named endpoint"): two `CreatePipe` calls, the
+/// parent ends made NON-inheritable and the broker ends INHERITABLE.
+///
+/// The broker ends keep their handle values across `CreateProcessW`
+/// inheritance, so the exact values from [`BrokerChannelChild::rd_value`] /
+/// [`BrokerChannelChild::wr_value`] go on the child's command line.
+pub fn create_anonymous_channel() -> io::Result<(BrokerChannelParent, BrokerChannelChild)> {
+    let (cmd_rd, cmd_wr) = anonymous_pipe()?;
+    let (resp_rd, resp_wr) = anonymous_pipe()?;
+    // The parent ends must NOT be inheritable; the broker ends MUST be.
+    // SAFETY: all four handles are live here; SetHandleInformation only
+    // toggles the inherit attribute.
+    let ok = unsafe {
+        SetHandleInformation(cmd_wr, HANDLE_FLAG_INHERIT, 0)
+            & SetHandleInformation(resp_rd, HANDLE_FLAG_INHERIT, 0)
+            & SetHandleInformation(cmd_rd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+            & SetHandleInformation(resp_wr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+    };
+    if ok == 0 {
+        let e = io::Error::last_os_error();
+        close_all(&[cmd_rd, cmd_wr, resp_rd, resp_wr]);
+        return Err(e);
+    }
+    Ok((
+        BrokerChannelParent {
+            cmd_wr,
+            resp_rd,
+        },
+        BrokerChannelChild { cmd_rd, resp_wr },
+    ))
+}
+
+fn anonymous_pipe() -> io::Result<(HANDLE, HANDLE)> {
+    let mut rd: HANDLE = std::ptr::null_mut();
+    let mut wr: HANDLE = std::ptr::null_mut();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 0,
+    };
+    // SAFETY: both out-handles receive fresh pipe ends.
+    if unsafe { CreatePipe(&mut rd, &mut wr, &attributes, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((rd, wr))
+}
+
+/// Spawns a `wsecret-broker` child over a private channel (WS: "private
+/// inherited anonymous-pipe channel"): the child inherits EXACTLY the two
+/// pipe handles of `child` — verified inheritable `FILE_TYPE_PIPE` ends,
+/// distinct and non-null — and NO standard handle (`STARTF_USESTDHANDLES`
+/// with NULLs; the broker owns its own console). The environment is passed
+/// verbatim (`SECRET_STORE` and everything else preserved). Birth hardening
+/// is unchanged: descriptors verified before the child runs and the launcher
+/// keeps only `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`.
+///
+/// The pair is consumed (the broker-side ends are closed in the parent right
+/// after the spawn).
+pub fn spawn_broker_child(
+    application: &std::ffi::OsStr,
+    argv: &[&std::ffi::OsStr],
+    child: BrokerChannelChild,
+) -> Result<AgentChild, io::Error> {
+    for handle in [child.cmd_rd, child.resp_wr] {
+        if handle.is_null() {
+            return Err(io::Error::other("broker channel handles must be non-null"));
+        }
+        // SAFETY: query-only checks on caller-owned handles.
+        let mut flags: u32 = 0;
+        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & HANDLE_FLAG_INHERIT == 0 {
+            return Err(io::Error::other("broker channel handle must be inheritable"));
+        }
+    }
+    if child.cmd_rd == child.resp_wr {
+        return Err(io::Error::other("broker channel handles must be distinct"));
+    }
+    let env_block = build_env_block(&[])?;
+    let spec = InheritSpec::BrokerChannel {
+        cmd_rd: child.cmd_rd,
+        resp_wr: child.resp_wr,
+    };
+    spawn_child_core(application, argv, env_block, spec)
 }
 
 /// Shared child-spawn body. `env_block` is the exact
-/// `CREATE_UNICODE_ENVIRONMENT` block. The child inherits only the explicitly
-/// listed handles — the deliberately duplicated standard handles.
+/// `CREATE_UNICODE_ENVIRONMENT` block. The child inherits ONLY the handles
+/// allowed by `spec` — the deliberately duplicated standard handles
+/// ([`InheritSpec::StdHandles`]) or exactly the two channel pipe handles
+/// ([`InheritSpec::BrokerChannel`]).
 fn spawn_child_core(
     application: &std::ffi::OsStr,
     argv: &[&std::ffi::OsStr],
     env_block: Vec<u16>,
+    spec: InheritSpec,
 ) -> Result<AgentChild, io::Error> {
     // Command line: argv[0] as typed + arguments, properly quoted.
     let mut cmdline: Vec<u16> = Vec::new();
@@ -579,49 +768,56 @@ fn spawn_child_core(
     let birth = ProcessBirthSecurity::new()
         .map_err(|_| io::Error::other("process hardening descriptor construction failed"))?;
 
-    // Deliberately duplicated std handles: the copies are created inheritable
-    // (the originals may not be) and are exactly what the child's std slots
-    // receive. NULL/invalid std handles contribute nothing to the allowlist.
+    // The inheritance allowlist and std slots are decided by the spec.
     let mut std_dups: Vec<HANDLE> = Vec::with_capacity(3);
-    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: standard handle query.
-        let orig = unsafe { GetStdHandle(which) };
-        if orig.is_null() || orig == INVALID_HANDLE_VALUE {
-            std_dups.push(ptr::null_mut());
-            continue;
-        }
-        let mut dup: HANDLE = ptr::null_mut();
-        // SAFETY: `GetCurrentProcess()` pseudo-handle targets our own
-        // process; `dup` receives a fresh inheritable copy of `orig`.
-        let ok = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                orig,
-                GetCurrentProcess(),
-                &mut dup,
-                0,
-                1,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if ok == 0 {
-            let e = io::Error::last_os_error();
-            for h in std_dups.drain(..) {
-                // SAFETY: live duplicate handles created above.
-                unsafe {
-                    if !h.is_null() {
-                        CloseHandle(h);
-                    }
-                }
-            }
-            return Err(e);
-        }
-        std_dups.push(dup);
-    }
-
-    // Only the duplicated std handles belong in the inheritance allowlist.
     let mut inherit: Vec<HANDLE> = Vec::with_capacity(3);
-    inherit.extend(std_dups.iter().copied().filter(|h| !h.is_null()));
+    match spec {
+        InheritSpec::StdHandles => {
+            // Deliberately duplicated std handles: the copies are created
+            // inheritable (the originals may not be) and are exactly what
+            // the child's std slots receive. NULL/invalid std handles
+            // contribute nothing to the allowlist.
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // SAFETY: standard handle query.
+                let orig = unsafe { GetStdHandle(which) };
+                if orig.is_null() || orig == INVALID_HANDLE_VALUE {
+                    std_dups.push(ptr::null_mut());
+                    continue;
+                }
+                let mut dup: HANDLE = ptr::null_mut();
+                // SAFETY: `GetCurrentProcess()` pseudo-handle targets our own
+                // process; `dup` receives a fresh inheritable copy of `orig`.
+                let ok = unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        orig,
+                        GetCurrentProcess(),
+                        &mut dup,
+                        0,
+                        1,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                if ok == 0 {
+                    let e = io::Error::last_os_error();
+                    close_all(&std_dups);
+                    return Err(e);
+                }
+                std_dups.push(dup);
+            }
+            // Only the duplicated std handles belong in the allowlist.
+            inherit.extend(std_dups.iter().copied().filter(|h| !h.is_null()));
+        }
+        InheritSpec::BrokerChannel { cmd_rd, resp_wr } => {
+            // EXACTLY the two private channel pipe handles (already verified
+            // inheritable by [`spawn_broker_child`]); std slots stay NULL
+            // (`STARTF_USESTDHANDLES` with nulls below), so no std handle
+            // and nothing else crosses the boundary.
+            std_dups.extend([ptr::null_mut(), ptr::null_mut(), ptr::null_mut()]);
+            inherit.push(cmd_rd);
+            inherit.push(resp_wr);
+        }
+    }
     let use_std_handles = !inherit.is_empty();
 
     // Reserve one attribute slot. With nothing to inherit, keep the list

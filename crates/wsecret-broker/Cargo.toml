@@ -1,0 +1,60 @@
+[package]
+name = "wsecret-broker"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The Quick Access secret broker: a separate process that owns ALL vault
+# secrets and sessions. The WinUI shell talks to it over a private inherited
+# anonymous-pipe channel (no named endpoint) and only ever receives metadata;
+# secret material leaves this process exclusively through the broker-owned
+# secure clipboard or native WebAuthn PRF (Hello) operations.
+
+[[bin]]
+name = "wsecret-broker"
+path = "src/main.rs"
+
+[dependencies]
+wsecret-core = { path = "../wsecret-core" }
+# Narrow pinned-libhydrogen boundary for the broker's own non-session crypto:
+# `random_buf` (Hello PRF salt/nonce), `secretbox_encrypt/decrypt` (Hello
+# binding seal), `hash` (SID binding), `memzero`/`equal` (erasure/compare) —
+# all verbatim upstream C (no cryptography in Rust).
+libhydrogen-sys = { path = "../libhydrogen-sys" }
+# Win32 surfaces used by the broker (same pinned version as the workspace):
+# - Win32_Foundation:              handle/error primitives, GlobalFree
+# - Win32_Graphics_Gdi:            stock GUI font, prompt window class brush
+# - Win32_Networking_WindowsWebServices: WebAuthn PRF (Hello)
+# - Win32_Security:                SECURITY_ATTRIBUTES for pipe creation
+# - Win32_Storage_FileSystem:      ReadFile/WriteFile/GetFileType on the channel
+# - Win32_System_DataExchange:     secure clipboard (open/set/sequence number)
+# - Win32_System_JobObjects:       atomic kill-on-close membership for prompt helper
+# - Win32_System_LibraryLoader:    module handle for the prompt window class
+# - Win32_System_Memory:           GlobalAlloc/GlobalLock (clipboard payloads)
+# - Win32_System_Ole:              CF_UNICODETEXT clipboard format constant
+# - Win32_System_Pipes:            CreatePipe/PeekNamedPipe (anonymous channel)
+# - Win32_System_SystemInformation: trusted SystemRoot for the helper's environment
+# - Win32_System_SystemServices:   SS_LEFT prompt label style
+# - Win32_System_Threading:        allowlisted helper launch/wait, AttachThreadInput
+# - Win32_UI_Controls:             EM_SETLIMITTEXT/EM_EMPTYUNDOBUFFER (masked edit)
+# - Win32_UI_Input_KeyboardAndMouse: SetFocus for the prompt edit control
+# - Win32_UI_WindowsAndMessaging:  broker-owned masked prompt window
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

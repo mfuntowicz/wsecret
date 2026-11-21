@@ -10,6 +10,7 @@ pub mod error;
 pub mod fault;
 pub mod format;
 pub mod pass;
+pub mod quick;
 pub mod session;
 pub mod store;
 pub mod totp;
@@ -20,4 +21,7 @@ pub use error::{
 };
 pub use format::Header;
 pub use session::{SecretBytes, Session};
-pub use store::{Limits, ScanMeta, ScanOutcome, Store};
+pub use store::{
+    CasFailure, CasMismatch, Limits, ScanMeta, ScanOutcome, SlotMeta, SlotRecord, Store,
+    OPS_LIMIT_MAX, STORE_BYTES_MAX,
+};
